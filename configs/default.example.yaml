@@ -1,0 +1,44 @@
+# AutOsu default configuration
+# Copy this file and modify for your setup.
+
+# ── Model paths ──────────────────────────────────────────────────────────
+detector_path: "runs/detect/train/weights/best.pt"
+approach_model_path: "runs/approach/best.pth"
+action_model_path: "runs/action/best.pth"
+
+# ── Device ───────────────────────────────────────────────────────────────
+device: "cuda:0"
+use_tensorrt: false
+
+# ── Detection ────────────────────────────────────────────────────────────
+conf_threshold: 0.3
+iou_threshold: 0.45
+model_input_w: 640
+model_input_h: 384
+
+# ── Capture ──────────────────────────────────────────────────────────────
+use_dxcam: true   # fall back to mss if unavailable
+
+# ── Runtime ──────────────────────────────────────────────────────────────
+target_fps: 120
+key_threshold: 0.5  # sigmoid probability threshold for Z/X key presses
+
+# ── Data generation (used by scripts/generate_dataset.py) ────────────────
+data:
+  raw_data_dir: "raw_data"   # contains beatmaps/ and replays/ subdirectories
+  skin_dir: "path/to/osu/skin"
+  output_dir: "dataset"
+  render_width: 640
+  render_height: 384
+  fps: 30
+  max_beatmaps: 100
+  train_ratio: 0.85
+  seed: 42
+
+# ── osu! API credentials (used by scripts/collect_data.py) ──────────────
+# Register at: https://osu.ppy.sh/home/account/edit -> "New OAuth Application"
+# IMPORTANT: Set callback URL to http://localhost:7272/callback
+osu_api:
+  client_id: ~       # integer, e.g. 12345
+  client_secret: ~   # string, e.g. "abcdef123456"
+  osu_session: ~         # string, paste from F12 -> Application -> Cookies

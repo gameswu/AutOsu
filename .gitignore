@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+
+# Environment (no longer used, config is in configs/*.yaml)
+.env
+configs/default.yaml
+.osu_token.json
+
+# Dataset (large, regenerate with scripts/generate_dataset.py)
+dataset/
+raw_data/
+labels_extra/
+lib/osr2mp4/res/
+
+# Training runs (large model weights)
+runs/
+
+# YOLO pretrained weights (downloaded on demand)
+yolov8n.pt
+
+# Model exports
+*.onnx
+*.engine
+*.trt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Logs
+*.log
+
+# UV lock (platform-specific, regenerate with uv sync)
+# uv.lock
