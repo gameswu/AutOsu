@@ -21,7 +21,6 @@ configs/default.yaml
 dataset/
 raw_data/
 labels_extra/
-lib/osr2mp4/res/
 
 # Training runs (large model weights)
 runs/
