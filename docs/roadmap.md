@@ -65,7 +65,6 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 - [x] Configurable FPS, max_beatmaps (post-filter), train/val split
 - [x] Outputs:
   - `dataset/images/` + `dataset/labels/` (YOLO format)
-  - `dataset/crops/` (64x64 approach estimator training)
   - `dataset/sequences/` (.npz state/action pairs)
   - `dataset/data.yaml`
 
@@ -93,10 +92,15 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 - [x] ONNX export built into training pipeline
 - [ ] TensorRT FP16 export + benchmark
 
-### 3b — Approach Estimator (`src/vision/approach_estimator.py`)
-- [x] 63K-param CNN (64x64 → approach_ratio)
-- [x] Training script (`scripts/train_approach.py`)
-- [x] Inference wrapper with batched prediction
+### 3b — Approach Estimator (`src/vision/approach_geometry.py`)
+- [x] Geometric CV: polar-unwrap around each object, read approach-ring radius
+- [x] `ratio = (4.0 - r_ring/r_disc) / 3.0`, self-calibrating, no model/GPU/crops
+- [x] Temporal linear-fit: objects are static and the ring shrinks at a constant
+      rate, so a global shrink-rate slope is pooled across all objects and each
+      object only needs its phase; monotonic-drop detection handles recycled
+      positions (stacked/streamed notes). Overall ratio MAE 0.18 → 0.13.
+- [x] Validation mode: `debug_action.py approach-geo` (vs ground-truth timing ratio)
+- [x] Replaced the old 63K-param CNN (poor calibration on small 64×64 crops)
 
 ---
 
@@ -160,6 +164,16 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 - [ ] Train action model: cursor MAE < 10px, key accuracy > 85%
 - [ ] End-to-end test on easy maps (2-3 star)
 - [ ] Record and review AI gameplay for failure analysis
+
+### 6c — Offline Inference Demo (`scripts/demo_inference.py`) [done]
+- [x] Re-renders a beatmap+replay and runs the full runtime stack per frame
+      (YOLO → geometric approach → GRU action) without launching osu!
+- [x] Annotated MP4 output: detection boxes + approach ratios, model cursor
+      (red, with trail) vs human/replay cursor (green), Z/X key lamps + HUD
+- [x] Closed-loop (autoregressive, shows BC drift) and `--teacher-forcing`
+      (open-loop, per-step accuracy) modes
+- [x] Reuses the shared `open_replay_frames()` render factory (one render frame
+      = one inference step; render fps should match training fps)
 
 ---
 

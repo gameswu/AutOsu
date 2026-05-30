@@ -6,8 +6,8 @@ approach timing estimation, and a learned action model to play beatmaps autonomo
 ## Architecture
 
 ```
-Screen Capture   →  YOLOv8n Detect  →  Approach Estimator  →  GRU Action Model  →  SendInput
-  (DXcam ~2ms)       (5 classes)        (64x64 crop CNN)       (state→action)      (1000Hz)
+Screen Capture   →  YOLOv8n Detect  →  Approach (geom CV)  →  GRU Action Model  →  SendInput
+  (DXcam ~2ms)       (5 classes)        (ring radius → ratio)  (state→action)      (1000Hz)
 ```
 
 The system is fully learned — no heuristic trajectory generation or rule-based
@@ -29,8 +29,10 @@ AutOsu/
 │   ├── generate_dataset.py     # .osu + .osr → training data (via osr2mp4 renderer)
 │   ├── preview.py              # Interactive rendering debug / video export
 │   ├── train_detector.py       # YOLOv8n training
-│   ├── train_approach.py       # Approach estimator CNN training
 │   ├── train_action.py         # GRU behavioral cloning training
+│   ├── demo_inference.py       # Offline "fake inference" — render + run full stack → annotated MP4
+│   ├── debug_action.py         # State/action + approach-ratio (approach-geo) validation
+│   ├── debug_overlay.py        # Live detection overlay on captured frames
 │   └── run.py                  # Runtime entry point (play / observe)
 ├── src/
 │   ├── data/
@@ -41,7 +43,7 @@ AutOsu/
 │   │   └── renderer.py         # osr2mp4 rendering wrapper → pixel-perfect frames
 │   ├── vision/
 │   │   ├── detector.py         # YOLO inference wrapper
-│   │   └── approach_estimator.py  # 64x64 crop → approach_ratio regression
+│   │   └── approach_geometry.py  # geometric (CV) approach_ratio from approach ring
 │   ├── action/
 │   │   ├── state.py            # GameStateVector / ActionVector definitions
 │   │   └── model.py            # GRU policy network + inference wrapper
@@ -187,7 +189,6 @@ Outputs:
 | Directory | Contents |
 |-----------|----------|
 | `dataset/images/` + `dataset/labels/` | YOLO detection images + labels (cursor rendered from replay) |
-| `dataset/crops/` | 64x64 approach estimator training crops |
 | `dataset/sequences/` | `.npz` state/action pairs for GRU training |
 | `dataset/data.yaml` | YOLO dataset descriptor |
 
@@ -230,13 +231,19 @@ python scripts/train_detector.py --epochs 100 --batch 16
 
 Output: `runs/detect/train/weights/best.pt` (auto-exports ONNX).
 
-### Step 3 — Train approach estimator
+### Step 3 — Approach ratio (no training)
+
+Approach ratio is computed at runtime by `src/vision/approach_geometry.py`
+using traditional CV: it measures the radius of the (still-shrinking) approach
+ring around each detected object and converts it to a ratio with exact geometry
+(ring goes from 4.0× → 1.0× the hitcircle radius). No model, no GPU, no crops.
+
+Validate it against ground-truth timing ratios on re-rendered replays:
 
 ```bash
-python scripts/train_approach.py --crops dataset/crops --epochs 30
+python scripts/debug_action.py approach-geo \
+    --data raw_data --skin "<skin dir>" --frames 1000
 ```
-
-Output: `runs/approach/best.pth`
 
 ### Step 4 — Train action model
 
@@ -262,6 +269,47 @@ python scripts/run.py play --config configs/my_config.yaml
 python scripts/run.py observe --device cpu
 ```
 
+### Step 5.5 — Offline inference demo (watch the model play, no osu! needed)
+
+`scripts/demo_inference.py` lets you *see the AI play a real beatmap without
+launching osu!*. Instead of capturing the live screen, it re-renders a beatmap +
+replay with the same osr2mp4 renderer used for training, then runs the **actual
+runtime stack** on every rendered frame and writes an annotated MP4:
+
+```
+rendered frame  →  YOLO detect  →  geometric approach ratio
+                →  GameStateVector  →  GRU action model  →  (dx, dy, z, x)
+```
+
+```bash
+uv run python scripts/demo_inference.py ^
+    --data raw_data ^
+    --skin "C:\Users\ASUS\AppData\Local\osu!\Skins\WhiteCat - Selyu v2.3" ^
+    --output demo.mp4 --frames 1200 --fps 15 --scale 2
+```
+
+The overlay shows:
+
+| Element | Meaning |
+|---------|---------|
+| Yellow boxes + `0.42` | Detections + geometric approach ratio (actionable objects) |
+| **Red** dot + trail | Model-driven cursor |
+| **Green** crosshair | Human (replay) cursor — ground-truth reference |
+| Z / X lamps + HUD | Predicted key probabilities, `dx/dy`, frame/time |
+
+Two modes isolate different behaviours:
+
+| Mode | Flag | What it shows |
+|------|------|---------------|
+| Closed-loop (default) | *(none)* | Model drives its own cursor autoregressively — true autonomous behaviour, exposes behavioural-cloning drift |
+| Teacher-forcing | `--teacher-forcing` | Model is fed the human cursor each step; plots its predicted next position — isolates per-step accuracy from drift |
+
+Useful options: `--index N` (which matched pair), `--fps` (should match training
+fps), `--scale` (output upscale), `--conf` (detector confidence). Requires the
+trained detector (`runs/detect/train/weights/best.pt`) and action model
+(`runs/action/best.pth`); if the action model is missing it overlays detections
+only.
+
 ### Optional — TensorRT export
 
 ```bash
@@ -274,7 +322,7 @@ trtexec --onnx=runs\detect\train\weights\best.onnx ^
 | Component | Architecture | Parameters | Input | Output |
 |-----------|-------------|-----------|-------|--------|
 | Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 5-class bounding boxes |
-| Approach Estimator | Custom CNN | 63K | 64x64 crop | approach_ratio [0, 1] |
+| Approach Estimator | Geometric CV (no model) | 0 | full frame + bbox | approach_ratio [0, 1] |
 | Action Model | GRU (2-layer) | 858K | 133-dim state vector | (dx, dy, key_z, key_x) |
 
 Detection classes: `hitcircle`(0), `slider_head`(1), `slider_body`(2), `slider_end`(3), `spinner`(4).

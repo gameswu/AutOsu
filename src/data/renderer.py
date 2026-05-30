@@ -106,7 +106,7 @@ def _make_settings(
     # Gameplay settings (disable all UI chrome we don't need)
     gameplay = dict(defaultsettings)
     gameplay["In-game interface"] = True   # needed so background renders properly
-    gameplay["Background dim"] = 80        # match typical osu! default (0-100)
+    gameplay["Background dim"] = 100       # 100 => engine clears frame to black (no bg)
     gameplay["Show scoreboard"] = False
     gameplay["Enable PP counter"] = False
     gameplay["Enable Strain Graph"] = False
@@ -427,3 +427,9 @@ class PlayfieldTransform:
         rx = int(osu_x * self.playfieldscale) + self.moveright
         ry = int(osu_y * self.playfieldscale) + self.movedown
         return rx, ry
+
+    def render_to_osu(self, render_x: float, render_y: float) -> Tuple[float, float]:
+        """Convert render-canvas pixel coords back to osu!pixel (512x384)."""
+        ox = (render_x - self.moveright) / self.playfieldscale
+        oy = (render_y - self.movedown) / self.playfieldscale
+        return ox, oy

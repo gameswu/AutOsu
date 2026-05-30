@@ -31,10 +31,14 @@ def prepare_approach(scale, time_preempt, settings):
 	img = YImage(approachcircle, settings).img
 	approach_frames = [] # 27 frames on 60 fps
 
-	s = 3.5
+	# Match real osu! stable: approach circle starts at 4.0x the hitcircle
+	# radius and shrinks to 1.0x at hit time (osr2mp4 originally used 3.5x).
+	# Keeping this aligned with the live game lets the geometric approach
+	# estimator use a single 4.0->1.0 constant for both training and inference.
+	s = 4.0
 	interval = settings.timeframe / settings.fps
 	for time_left in np.arange(time_preempt, 0, -interval):
-		s -= 2.5 * interval / time_preempt
+		s -= 3.0 * interval / time_preempt
 		p = imageproc.change_size(img, s * scale, s * scale)
 		approach_frames.append(p)
 	

@@ -23,7 +23,6 @@ capture = ["dxcam>=0.0.5", "mss>=9.0"]
 autosu-run = "scripts.run:main"
 autosu-generate = "scripts.generate_dataset:main"
 autosu-train-detect = "scripts.train_detector:main"
-autosu-train-approach = "scripts.train_approach:main"
 autosu-train-action = "scripts.train_action:main"
 
 [tool.uv.sources]

@@ -4,8 +4,7 @@ Generate training data from raw_data/ (beatmaps + replays).
 
 Produces:
   1. YOLO detection dataset (images + labels) -- with cursor rendered
-  2. Approach estimator crops (64x64 with approach_ratio label)
-  3. Action model sequences (state_vector, action) pairs as .npz
+  2. Action model sequences (state_vector, action) pairs as .npz
 
 Input data structure::
 
@@ -45,6 +44,65 @@ if _LIB_DIR not in sys.path:
 
 import cv2
 import numpy as np
+
+
+def open_replay_frames(osu_path, osr_path, skin_path, width, height, fps):
+    """
+    Construct a renderer for one (beatmap, replay) pair and return a per-frame
+    generator. Shared by dataset generation and the approach-geo validator.
+
+    The renderer is constructed eagerly, so a bad replay raises here (the caller
+    can catch and skip) rather than mid-iteration.
+
+    Returns:
+        (renderer, frame_iter) where frame_iter yields dicts with keys:
+            frame (HxWx3 BGR uint8), t_ms, frame_idx,
+            visible (list of non-fadeout hit objects),
+            cursor_x, cursor_y, key_z, key_x,
+            time_preempt, radius_osu
+    """
+    from src.data.renderer import Osr2mp4Renderer
+    from osr2mp4.CheckSystem.Judgement import DiffCalculator
+    from osr2mp4.EEnum.EReplay import Replays
+
+    renderer = Osr2mp4Renderer(
+        osu_path=str(osu_path),
+        osr_path=str(osr_path),
+        skin_path=str(skin_path),
+        width=width,
+        height=height,
+        fps=fps,
+    )
+
+    time_preempt = renderer.time_preempt
+    radius_osu = DiffCalculator(renderer.beatmap.diff).max_distance
+    replay_data = renderer.replay_info.play_data
+
+    def _gen():
+        frame_idx = 0
+        while renderer.has_frames():
+            frame, t_ms = renderer.render_frame()
+            frame_idx += 1
+
+            osr_idx = min(renderer.frame_info.osr_index, len(replay_data) - 1)
+            cursor_x = float(replay_data[osr_idx][Replays.CURSOR_X])
+            cursor_y = float(replay_data[osr_idx][Replays.CURSOR_Y])
+            keys = int(replay_data[osr_idx][Replays.KEYS_PRESSED])
+            key_z = float((keys >> 2) & 1)  # K1
+            key_x = float((keys >> 3) & 1)  # K2
+
+            visible_raw = renderer.get_visible_objects()
+            visible = [obj for obj, is_fadeout in visible_raw if not is_fadeout]
+
+            yield {
+                "frame": frame, "t_ms": t_ms, "frame_idx": frame_idx,
+                "visible": visible,
+                "cursor_x": cursor_x, "cursor_y": cursor_y,
+                "key_z": key_z, "key_x": key_x,
+                "time_preempt": time_preempt, "radius_osu": radius_osu,
+            }
+
+    return renderer, _gen()
 
 
 def main():
@@ -94,7 +152,6 @@ def main():
     (out / "images" / "val").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "train").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "val").mkdir(parents=True, exist_ok=True)
-    (out / "crops").mkdir(parents=True, exist_ok=True)
     (out / "sequences").mkdir(parents=True, exist_ok=True)
 
     # Coordinate transform for YOLO labels
@@ -102,7 +159,6 @@ def main():
 
     random.seed(args.seed)
     total_frames = 0
-    total_crops = 0
     total_sequences = 0
 
     for pair_idx, (osu_path, osr_paths) in enumerate(pairs):
@@ -111,13 +167,9 @@ def main():
 
         for osr_path in osr_paths:
             try:
-                renderer = Osr2mp4Renderer(
-                    osu_path=str(osu_path),
-                    osr_path=str(osr_path),
-                    skin_path=str(args.skin),
-                    width=args.width,
-                    height=args.height,
-                    fps=args.fps,
+                renderer, frame_iter = open_replay_frames(
+                    osu_path, osr_path, args.skin,
+                    args.width, args.height, args.fps,
                 )
             except Exception as e:
                 print(f"  Skip replay (renderer init error): {osr_path.name}: {e}")
@@ -129,44 +181,20 @@ def main():
             is_train = random.random() < args.train_ratio
             split = "train" if is_train else "val"
 
-            # Extract hit object info for YOLO labels
-            beatmap = renderer.beatmap
-            time_preempt = renderer.time_preempt
-            hitobjects = beatmap.hitobjects
-
-            # Get circle radius in osu!pixels from CS
-            from osr2mp4.CheckSystem.Judgement import DiffCalculator
-            diff_calc = DiffCalculator(beatmap.diff)
-            radius_osu = diff_calc.max_distance  # radius in osu! pixels
-
-            # Replay data for cursor + key extraction
-            replay_data = renderer.replay_info.play_data
-            from osr2mp4.EEnum.EReplay import Replays
-
             # Action sequence buffers
             sequence_states = []
             sequence_actions = []
             prev_cx, prev_cy = 256.0, 192.0
             prev_t_ms = 0.0
 
-            frame_idx = 0
-            while renderer.has_frames():
-                frame, t_ms = renderer.render_frame()
-                frame_idx += 1
+            from src.action.state import GameStateVector, ActionVector
 
-                # Get cursor position from replay data at current osr_index
-                osr_idx = renderer.frame_info.osr_index
-                osr_idx = min(osr_idx, len(replay_data) - 1)
-                cursor_x = float(replay_data[osr_idx][Replays.CURSOR_X])
-                cursor_y = float(replay_data[osr_idx][Replays.CURSOR_Y])
-                keys = int(replay_data[osr_idx][Replays.KEYS_PRESSED])
-                key_z = float((keys >> 2) & 1)  # K1
-                key_x = float((keys >> 3) & 1)  # K2
-
-                # Get objects currently displayed by osr2mp4 (exact sync)
-                visible_raw = renderer.get_visible_objects()
-                # Filter out objects already in fadeout (hit/missed)
-                visible = [obj for obj, is_fadeout in visible_raw if not is_fadeout]
+            for fd in frame_iter:
+                frame, t_ms, frame_idx = fd["frame"], fd["t_ms"], fd["frame_idx"]
+                visible = fd["visible"]
+                time_preempt, radius_osu = fd["time_preempt"], fd["radius_osu"]
+                cursor_x, cursor_y = fd["cursor_x"], fd["cursor_y"]
+                key_z, key_x = fd["key_z"], fd["key_x"]
 
                 if visible:
                     # Generate YOLO labels
@@ -185,36 +213,12 @@ def main():
                             f.write("\n".join(labels))
                         total_frames += 1
 
-                        # Save 64x64 crops for approach estimator
-                        h_frame, w_frame = frame.shape[:2]
-                        for lbl_line in labels:
-                            parts = lbl_line.split()
-                            cls_id = int(parts[0])
-                            if cls_id not in (0, 1):  # hitcircle, slider_head only
-                                continue
-                            cx_n, cy_n = float(parts[1]), float(parts[2])
-                            px = int(cx_n * w_frame)
-                            py = int(cy_n * h_frame)
-                            x1, y1 = max(0, px - 32), max(0, py - 32)
-                            x2, y2 = min(w_frame, px + 32), min(h_frame, py + 32)
-                            crop = frame[y1:y2, x1:x2]
-                            if crop.shape[0] != 64 or crop.shape[1] != 64:
-                                padded = np.zeros((64, 64, 3), dtype=np.uint8)
-                                padded[:crop.shape[0], :crop.shape[1]] = crop
-                                crop = padded
-                            ratio = _approach_ratio(parts, t_ms, visible, time_preempt)
-                            crop_name = f"crop_{total_crops:08d}_{ratio:.4f}.jpg"
-                            cv2.imwrite(str(out / "crops" / crop_name), crop,
-                                        [cv2.IMWRITE_JPEG_QUALITY, 90])
-                            total_crops += 1
-
                 # Build state/action for action model
                 dt_ms = t_ms - prev_t_ms
                 objects = _build_object_states(visible, t_ms, time_preempt)
                 vx = (cursor_x - prev_cx) / max(1, dt_ms) if dt_ms > 0 else 0
                 vy = (cursor_y - prev_cy) / max(1, dt_ms) if dt_ms > 0 else 0
 
-                from src.action.state import GameStateVector, ObjectState, ActionVector
                 state = GameStateVector(
                     objects=objects,
                     cursor_x=prev_cx, cursor_y=prev_cy,
@@ -236,7 +240,7 @@ def main():
 
                 if frame_idx % 500 == 0:
                     print(f"    frame {frame_idx}, t={t_ms:.0f}ms, "
-                          f"imgs={total_frames}, crops={total_crops}")
+                          f"imgs={total_frames}")
 
             # Save sequence
             if sequence_states:
@@ -254,7 +258,6 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"Dataset generation complete:")
     print(f"  Frames: {total_frames}")
-    print(f"  Crops: {total_crops}")
     print(f"  Sequences: {total_sequences}")
     print(f"  Output: {out.resolve()}")
 

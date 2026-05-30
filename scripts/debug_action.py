@@ -216,15 +216,10 @@ def cmd_live(args):
                         imgsz=(model_h, model_w))
     detector.load()
 
-    # Approach estimator
-    from src.vision.approach_estimator import ApproachEstimatorInference
-    approach_path = Path(cfg.get("approach_model_path", "runs/approach/best.pth"))
-    approach_estimator = None
-    if approach_path.exists():
-        approach_estimator = ApproachEstimatorInference(approach_path, device=device)
-        print("[Live] Approach estimator loaded")
-    else:
-        print("[Live] Approach estimator not found — approach_ratio will be 0")
+    # Approach estimator (geometric CV — no model)
+    from src.vision.approach_geometry import GeometricApproachEstimator
+    approach_estimator = GeometricApproachEstimator()
+    print("[Live] Approach estimator: geometric CV (no model)")
 
     # Action model
     from src.action.model import ActionModelInference
@@ -282,24 +277,9 @@ def cmd_live(args):
             dets = detector.detect(frame, timestamp_ms=now_ms)
 
             # Estimate approach ratios (same as pipeline.py)
-            if approach_estimator:
-                actionable = dets.actionable_objects
-                if actionable:
-                    h_frame, w_frame = frame.shape[:2]
-                    crops = []
-                    for det in actionable:
-                        px, py = int(det.cx), int(det.cy)
-                        x1, y1 = max(0, px - 32), max(0, py - 32)
-                        x2, y2 = min(w_frame, px + 32), min(h_frame, py + 32)
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.shape[0] != 64 or crop.shape[1] != 64:
-                            padded = np.zeros((64, 64, 3), dtype=np.uint8)
-                            padded[:crop.shape[0], :crop.shape[1]] = crop
-                            crop = padded
-                        crops.append(crop)
-                    ratios = approach_estimator.predict(crops)
-                    for det, ratio in zip(actionable, ratios):
-                        det.approach_ratio = ratio
+            actionable = dets.actionable_objects
+            if actionable:
+                approach_estimator.estimate(frame, actionable)
 
             # Read actual cursor
             sx, sy = get_cursor()
@@ -381,81 +361,129 @@ def cmd_live(args):
     print(f"\n[Live] {frame_idx} frames captured.")
 
 
-# ── approach mode ───────────────────────────────────────────────────────
+# ── approach-geo mode ─────────────────────────────────────────────────────
 
-def cmd_approach(args):
-    """Validate approach estimator on training crops."""
-    import random
-    import torch
-    from src.vision.approach_estimator import ApproachEstimator
+def cmd_approach_geo(args):
+    """
+    Validate the geometric approach estimator against ground-truth timing
+    ratios, by re-rendering (beatmap, replay) pairs with no background and
+    measuring each object's approach ring directly from the rendered frame.
+    """
+    import sys
+    # scripts/ dir on path so we can reuse the render helpers
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from generate_dataset import open_replay_frames, _generate_labels, _obj_kind
+    from src.data.replay_parser import find_replay_pairs
+    from src.data.renderer import PlayfieldTransform
+    from src.vision.approach_geometry import GeometricApproachEstimator
+    from src.vision.detector import Detection, ObjClass
 
-    model_path = Path(args.model)
-    if not model_path.exists():
-        print(f"Approach model not found: {model_path}")
+    pairs = find_replay_pairs(args.data)
+    if not pairs:
+        print(f"No (beatmap, replay) pairs found in {args.data}")
         return
 
-    crops_dir = Path(args.crops)
-    all_crops = sorted(crops_dir.glob("crop_*.jpg"))
-    if not all_crops:
-        print(f"No crops found in {crops_dir}")
-        return
+    W, H = args.width, args.height
+    tf = PlayfieldTransform(W, H)
+    estimator = GeometricApproachEstimator(temporal=not args.no_temporal)
+    mode = "per-frame only" if args.no_temporal else "temporal linear-fit"
+    print(f"Estimator mode: {mode}")
 
-    model = ApproachEstimator()
-    state_dict = torch.load(str(model_path), map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
-    model.eval()
-    print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
-    print(f"Crops: {len(all_crops)}")
-
-    import cv2
-
-    random.seed(42)
-    sample = random.sample(all_crops, min(args.n, len(all_crops)))
-
-    preds_list, labels_list = [], []
-    with torch.no_grad():
-        for p in sample:
-            label = float(p.stem.rsplit("_", 1)[-1])
-            img = cv2.imread(str(p))
-            if img is None:
+    def gt_ratio_by_pos(cx, cy, visible, t_ms, time_preempt):
+        """Ground-truth timing ratio of the visible object closest to (cx, cy)."""
+        best, best_d = None, 1e18
+        for obj in visible:
+            if _obj_kind(obj) not in ("circle", "slider"):
                 continue
-            if img.shape[:2] != (64, 64):
-                img = cv2.resize(img, (64, 64))
-            t = torch.from_numpy(img[:, :, ::-1].copy()).float() / 255.0
-            t = t.permute(2, 0, 1).unsqueeze(0)
-            pred = model(t).item()
-            preds_list.append(pred)
-            labels_list.append(label)
+            rx, ry = tf.osu_to_render(obj["x"], obj["y"])
+            d = (rx - cx) ** 2 + (ry - cy) ** 2
+            if d < best_d:
+                best_d, best = d, obj
+        if best is None or time_preempt <= 0:
+            return None
+        dt = t_ms - (best["time"] - time_preempt)
+        return min(1.0, max(0.0, dt / time_preempt))
 
-    preds = np.array(preds_list)
-    labels = np.array(labels_list)
-    errs = np.abs(preds - labels)
+    gts, preds = [], []
+    frames_done = 0
+    print(f"Rendering up to {args.frames} frames (no background)…")
+    for osu_path, osr_paths in pairs:
+        for osr_path in osr_paths:
+            try:
+                _, frame_iter = open_replay_frames(
+                    osu_path, osr_path, args.skin, W, H, args.fps,
+                )
+            except Exception as e:
+                print(f"  skip {osr_path.name}: {e}")
+                continue
+            estimator.reset()  # tracks must not carry across replays
+            for fd in frame_iter:
+                frame, visible = fd["frame"], fd["visible"]
+                if visible:
+                    labels = _generate_labels(
+                        visible, fd["t_ms"], fd["time_preempt"],
+                        fd["radius_osu"], tf, W, H,
+                    )
+                    # Build lightweight detections for actionable classes
+                    dets, dets_gt = [], []
+                    for line in labels:
+                        parts = line.split()
+                        cls_id = int(parts[0])
+                        if cls_id not in (0, 1):  # hitcircle, slider_head
+                            continue
+                        cx = float(parts[1]) * W
+                        cy = float(parts[2]) * H
+                        bw = float(parts[3]) * W
+                        bh = float(parts[4]) * H
+                        gt = gt_ratio_by_pos(
+                            cx, cy, visible, fd["t_ms"], fd["time_preempt"],
+                        )
+                        if gt is None:
+                            continue
+                        dets.append(Detection(
+                            cls=ObjClass(cls_id), confidence=1.0,
+                            cx=cx, cy=cy, w=bw, h=bh,
+                        ))
+                        dets_gt.append(gt)
+                    if dets:
+                        estimator.estimate(frame, dets, t_ms=fd["t_ms"])
+                        for d, gt in zip(dets, dets_gt):
+                            gts.append(gt)
+                            preds.append(d.approach_ratio)
+                frames_done += 1
+                if frames_done % 200 == 0:
+                    print(f"  …{frames_done} frames, {len(gts)} measurements")
+                if frames_done >= args.frames:
+                    break
+            if frames_done >= args.frames:
+                break
+        if frames_done >= args.frames:
+            break
+
+    if not gts:
+        print("No measurements collected.")
+        return
+
+    gts = np.array(gts)
+    preds = np.array(preds)
+    errs = np.abs(preds - gts)
     n = len(errs)
 
-    print(f"\n=== Approach Estimator Validation ({n} samples) ===")
-    print(f"  Label range:  [{labels.min():.4f}, {labels.max():.4f}]")
-    print(f"  Pred range:   [{preds.min():.4f}, {preds.max():.4f}]")
-    print(f"  MAE:          {errs.mean():.4f}")
-    print(f"  Max error:    {errs.max():.4f}")
-    print(f"  Median error: {np.median(errs):.4f}")
+    print(f"\n=== Geometric Approach Validation ({n} measurements) ===")
+    print(f"  GT range:    [{gts.min():.4f}, {gts.max():.4f}]")
+    print(f"  Pred range:  [{preds.min():.4f}, {preds.max():.4f}]")
+    print(f"  MAE:         {errs.mean():.4f}")
+    print(f"  Median err:  {np.median(errs):.4f}")
+    print(f"  Max err:     {errs.max():.4f}")
 
-    # Bucketed accuracy
     buckets = [(0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
-    print(f"\n  Bucket MAE:")
+    print(f"\n  Bucket MAE (by GT ratio):")
     for lo, hi in buckets:
-        mask = (labels >= lo) & (labels < hi)
+        mask = (gts >= lo) & (gts < hi)
         if mask.sum() > 0:
-            print(f"    [{lo:.1f}, {hi:.1f}):  n={mask.sum():4d}  "
+            print(f"    [{lo:.1f}, {hi:.1f}):  n={mask.sum():5d}  "
                   f"MAE={errs[mask].mean():.4f}  "
                   f"pred_mean={preds[mask].mean():.4f}")
-
-    # Sample predictions sorted by label
-    print(f"\n  Sample (sorted by label):")
-    print(f"    {'label':>8}  {'pred':>8}  {'err':>8}")
-    indices = np.argsort(labels)
-    step = max(1, len(indices) // 15)
-    for i in indices[::step]:
-        print(f"    {labels[i]:8.4f}  {preds[i]:8.4f}  {errs[i]:8.4f}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -480,10 +508,18 @@ def main():
     p_live.add_argument("--config", "-c", default="configs/default.yaml")
     p_live.add_argument("--device", default=None)
 
-    p_approach = sub.add_parser("approach", help="Validate approach estimator on training crops")
-    p_approach.add_argument("--model", default="runs/approach/best.pth")
-    p_approach.add_argument("--crops", default="dataset/crops")
-    p_approach.add_argument("--n", type=int, default=500, help="Number of samples to test")
+    p_geo = sub.add_parser("approach-geo",
+                           help="Validate geometric approach estimator vs timing GT (re-renders)")
+    p_geo.add_argument("--data", "-d", required=True,
+                       help="raw_data dir (beatmaps/ + replays/)")
+    p_geo.add_argument("--skin", "-s", required=True, help="osu! skin directory")
+    p_geo.add_argument("--width", type=int, default=640)
+    p_geo.add_argument("--height", type=int, default=384)
+    p_geo.add_argument("--fps", type=int, default=30)
+    p_geo.add_argument("--frames", type=int, default=1000,
+                       help="Max frames to render across pairs")
+    p_geo.add_argument("--no-temporal", action="store_true",
+                       help="Disable temporal linear-fit (pure per-frame geometry)")
 
     args = parser.parse_args()
     if args.cmd == "stats":
@@ -492,8 +528,8 @@ def main():
         cmd_replay(args)
     elif args.cmd == "live":
         cmd_live(args)
-    elif args.cmd == "approach":
-        cmd_approach(args)
+    elif args.cmd == "approach-geo":
+        cmd_approach_geo(args)
     else:
         parser.print_help()
 

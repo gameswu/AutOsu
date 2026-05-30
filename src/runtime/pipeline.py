@@ -23,7 +23,6 @@ class PipelineConfig:
     """Pipeline configuration."""
     # Models
     detector_path: str = "runs/detect/best.pt"
-    approach_model_path: str = "runs/approach/best.pth"
     action_model_path: str = "runs/action/best.pth"
     device: str = "cuda:0"
 
@@ -110,16 +109,11 @@ class GamePipeline:
         self._detector.load()
         print(f"[Pipeline] Detector loaded: {detector_path.name}")
 
-        # Approach estimator (optional)
-        approach_path = Path(self.config.approach_model_path)
-        if approach_path.exists():
-            from src.vision.approach_estimator import ApproachEstimatorInference
-            self._approach_estimator = ApproachEstimatorInference(
-                approach_path, device=self.config.device
-            )
-            print(f"[Pipeline] Approach estimator loaded")
-        else:
-            print(f"[Pipeline] Approach estimator not found, skipping")
+        # Approach estimator (geometric CV — no model file needed)
+        from src.vision.approach_geometry import GeometricApproachEstimator
+        self._approach_estimator = GeometricApproachEstimator()
+        self._approach_estimator.reset()
+        print(f"[Pipeline] Approach estimator: geometric CV + temporal fit (no model)")
 
         # Action model (optional - can run detection-only)
         action_path = Path(self.config.action_model_path)
@@ -235,27 +229,16 @@ class GamePipeline:
                 time.sleep(sleep_time)
 
     def _estimate_approach(self, frame: np.ndarray, detections: FrameDetections):
-        """Crop and estimate approach_ratio for actionable objects."""
+        """Estimate approach_ratio for actionable objects via geometric CV."""
         actionable = detections.actionable_objects
         if not actionable:
             return
-
-        h, w = frame.shape[:2]
-        crops = []
-        for det in actionable:
-            px, py = int(det.cx), int(det.cy)
-            x1, y1 = max(0, px - 32), max(0, py - 32)
-            x2, y2 = min(w, px + 32), min(h, py + 32)
-            crop = frame[y1:y2, x1:x2]
-            if crop.shape[0] != 64 or crop.shape[1] != 64:
-                padded = np.zeros((64, 64, 3), dtype=np.uint8)
-                padded[:crop.shape[0], :crop.shape[1]] = crop
-                crop = padded
-            crops.append(crop)
-
-        ratios = self._approach_estimator.predict(crops)
-        for det, ratio in zip(actionable, ratios):
-            det.approach_ratio = ratio
+        # Sets det.approach_ratio in-place by measuring the approach-circle
+        # radius directly from the frame (no neural network, no crops), with
+        # temporal linear-fit filtering keyed by the frame timestamp.
+        self._approach_estimator.estimate(
+            frame, actionable, t_ms=detections.timestamp_ms
+        )
 
     def _build_state(self, detections: FrameDetections, now_ms: float) -> GameStateVector:
         """Convert detections to a GameStateVector."""

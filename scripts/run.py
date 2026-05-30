@@ -59,7 +59,6 @@ def main():
 
     pipeline_cfg = PipelineConfig(
         detector_path=cfg.get("detector_path", "runs/detect/train/weights/best.pt"),
-        approach_model_path=cfg.get("approach_model_path", "runs/approach/best.pth"),
         action_model_path=cfg.get("action_model_path", "runs/action/best.pth"),
         device=args.device or cfg.get("device", "cuda:0"),
         conf_threshold=cfg.get("conf_threshold", 0.3),
@@ -92,7 +91,6 @@ def main():
         print(f"\n[ERROR] {e}")
         print("Make sure you have trained the models first:")
         print("  python scripts/train_detector.py")
-        print("  python scripts/train_approach.py")
         print("  python scripts/train_action.py")
         sys.exit(1)
     except Exception as e:

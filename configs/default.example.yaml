@@ -3,7 +3,6 @@
 
 # ── Model paths ──────────────────────────────────────────────────────────
 detector_path: "runs/detect/train/weights/best.pt"
-approach_model_path: "runs/approach/best.pth"
 action_model_path: "runs/action/best.pth"
 
 # ── Device ───────────────────────────────────────────────────────────────

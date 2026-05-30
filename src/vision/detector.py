@@ -43,7 +43,7 @@ class Detection:
     # Converted osu! coordinates (set by pipeline after detection)
     osu_x: float = 0.0
     osu_y: float = 0.0
-    # Approach ratio (set by ApproachEstimator, 0=just appeared, 1=hit time)
+    # Approach ratio (set by GeometricApproachEstimator, 0=just appeared, 1=hit time)
     approach_ratio: float = 0.0
 
     @property
