@@ -3,7 +3,6 @@
 
 # ── Model paths ──────────────────────────────────────────────────────────
 detector_path: "runs/detect/train/weights/best.pt"
-action_model_path: "runs/action/best.pth"
 
 # ── Device ───────────────────────────────────────────────────────────────
 device: "cuda:0"
@@ -20,7 +19,13 @@ use_dxcam: true   # fall back to mss if unavailable
 
 # ── Runtime ──────────────────────────────────────────────────────────────
 target_fps: 120
-key_threshold: 0.5  # sigmoid probability threshold for Z/X key presses
+
+# ── Controller (deterministic vision-only player) ────────────────────────
+hit_window: 0.90        # tap once approach_ratio >= this
+hit_radius_osu: 80.0    # cursor must be within this of the target to tap
+tap_hold_ms: 40.0       # how long a tap key stays held
+spin_radius_osu: 60.0   # spinner sweep radius
+motion_jitter: 1.2      # peak human-like jitter amplitude (osu!px)
 
 # ── Data generation (used by scripts/generate_dataset.py) ────────────────
 data:

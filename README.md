@@ -1,18 +1,21 @@
 # AutOsu
 
 Vision-based osu! standard mode AI player. Uses screen capture, object detection,
-approach timing estimation, and a learned action model to play beatmaps autonomously.
+approach-circle timing, and a deterministic vision-only controller to play
+beatmaps autonomously.
 
 ## Architecture
 
 ```
-Screen Capture   →  YOLOv8n Detect  →  Approach (geom CV)  →  GRU Action Model  →  SendInput
-  (DXcam ~2ms)       (5 classes)        (ring radius → ratio)  (state→action)      (1000Hz)
+Screen Capture   →  YOLOv8n Detect  →  Approach (ring box)  →  Controller       →  SendInput
+  (DXcam ~2ms)       (7 classes)        (ring size → ratio)    (target + path)     (1000Hz)
 ```
 
-The system is fully learned — no heuristic trajectory generation or rule-based
-controllers. Cursor movement and key timing are both produced by a GRU network
-trained via behavioral cloning from human replays (.osr files).
+Detection is learned (YOLO); everything downstream is **deterministic and
+vision-only** — no behavioral cloning. Timing comes from the detected
+approach-circle box size, and cursor movement / key timing are produced by a
+hand-written controller (min-jerk motion to the most imminent object, reactive
+slider-ball following, circular spinner sweep).
 
 ## Project Structure
 
@@ -29,9 +32,8 @@ AutOsu/
 │   ├── generate_dataset.py     # .osu + .osr → training data (via osr2mp4 renderer)
 │   ├── preview.py              # Interactive rendering debug / video export
 │   ├── train_detector.py       # YOLOv8n training
-│   ├── train_action.py         # GRU behavioral cloning training
 │   ├── demo_inference.py       # Offline "fake inference" — render + run full stack → annotated MP4
-│   ├── debug_action.py         # State/action + approach-ratio (approach-geo) validation
+│   ├── debug_action.py         # Controller (live) + approach-ratio (approach-geo) diagnostics
 │   ├── debug_overlay.py        # Live detection overlay on captured frames
 │   └── run.py                  # Runtime entry point (play / observe)
 ├── src/
@@ -43,12 +45,15 @@ AutOsu/
 │   │   └── renderer.py         # osr2mp4 rendering wrapper → pixel-perfect frames
 │   ├── vision/
 │   │   ├── detector.py         # YOLO inference wrapper
-│   │   └── approach_geometry.py  # geometric (CV) approach_ratio from approach ring
-│   ├── action/
-│   │   ├── state.py            # GameStateVector / ActionVector definitions
-│   │   └── model.py            # GRU policy network + inference wrapper
+│   │   ├── approach_from_boxes.py  # approach_ratio from detected approach-ring boxes (primary)
+│   │   └── approach_geometry.py    # geometric (CV) approach_ratio from approach ring (fallback)
+│   ├── control/
+│   │   ├── tracker.py          # online timing tracker (approach-ratio → time-to-hit)
+│   │   ├── planner.py          # scene building + target selection
+│   │   ├── motion.py           # human-like min-jerk motion + smoothing
+│   │   └── controller.py       # deterministic state machine → cursor target + keys
 │   └── runtime/
-│       ├── pipeline.py         # Main loop: capture→detect→state→action→inject
+│       ├── pipeline.py         # Main loop: capture→detect→approach→controller→inject
 │       ├── capture.py          # DXcam / mss screen capture
 │       ├── window.py           # Win32 osu! window detection + coord mapping
 │       └── injector.py         # Win32 SendInput + MockInjector
@@ -189,8 +194,11 @@ Outputs:
 | Directory | Contents |
 |-----------|----------|
 | `dataset/images/` + `dataset/labels/` | YOLO detection images + labels (cursor rendered from replay) |
-| `dataset/sequences/` | `.npz` state/action pairs for GRU training |
-| `dataset/data.yaml` | YOLO dataset descriptor |
+| `dataset/data.yaml` | YOLO dataset descriptor (7 classes) |
+
+The generator also emits the approach-circle (class 5) and slider-ball (class 6)
+labels and class-balances the train split by oversampling rare-class frames
+(`--no-balance` / `--balance-max-factor N` to tune).
 
 ### Step 1.5 — Preview & debug rendering
 
@@ -233,25 +241,30 @@ Output: `runs/detect/train/weights/best.pt` (auto-exports ONNX).
 
 ### Step 3 — Approach ratio (no training)
 
-Approach ratio is computed at runtime by `src/vision/approach_geometry.py`
-using traditional CV: it measures the radius of the (still-shrinking) approach
-ring around each detected object and converts it to a ratio with exact geometry
-(ring goes from 4.0× → 1.0× the hitcircle radius). No model, no GPU, no crops.
+Approach ratio is computed at runtime from vision only. The **primary** path
+(`src/vision/approach_from_boxes.py`) pairs each detected approach-circle box
+(class 5) with its hitcircle / slider-head and converts the ring size to a
+ratio with exact geometry (ring shrinks from 4.0× → 1.0× the hitcircle radius).
+A geometric CV estimator (`src/vision/approach_geometry.py`) remains as a
+no-detection fallback. No model, no GPU, no crops.
 
-Validate it against ground-truth timing ratios on re-rendered replays:
+Validate the geometric estimator against ground-truth timing ratios on
+re-rendered replays:
 
 ```bash
 python scripts/debug_action.py approach-geo \
     --data raw_data --skin "<skin dir>" --frames 1000
 ```
 
-### Step 4 — Train action model
+### Step 4 — Controller (no training)
+
+There is no action model to train. The deterministic controller in
+`src/control/` consumes detections + approach ratios every frame and emits a
+cursor target and key state. Inspect it live (capture only, no input injected):
 
 ```bash
-python scripts/train_action.py --sequences dataset/sequences --epochs 60
+python scripts/debug_action.py live
 ```
-
-Output: `runs/action/best.pth`
 
 ### Step 5 — Run the AI
 
@@ -277,8 +290,8 @@ replay with the same osr2mp4 renderer used for training, then runs the **actual
 runtime stack** on every rendered frame and writes an annotated MP4:
 
 ```
-rendered frame  →  YOLO detect  →  geometric approach ratio
-                →  GameStateVector  →  GRU action model  →  (dx, dy, z, x)
+rendered frame  →  YOLO detect  →  approach-ring ratio
+                →  deterministic controller  →  cursor target + (z, x)
 ```
 
 ```bash
@@ -292,23 +305,16 @@ The overlay shows:
 
 | Element | Meaning |
 |---------|---------|
-| Yellow boxes + `0.42` | Detections + geometric approach ratio (actionable objects) |
-| **Red** dot + trail | Model-driven cursor |
+| Yellow boxes + `0.42` | Detections + approach ratio (actionable objects) |
+| Ring / ball boxes | Detected approach circles and slider balls |
+| **Red** dot + trail | Controller-driven cursor |
 | **Green** crosshair | Human (replay) cursor — ground-truth reference |
-| Z / X lamps + HUD | Predicted key probabilities, `dx/dy`, frame/time |
-
-Two modes isolate different behaviours:
-
-| Mode | Flag | What it shows |
-|------|------|---------------|
-| Closed-loop (default) | *(none)* | Model drives its own cursor autoregressively — true autonomous behaviour, exposes behavioural-cloning drift |
-| Teacher-forcing | `--teacher-forcing` | Model is fed the human cursor each step; plots its predicted next position — isolates per-step accuracy from drift |
+| Z / X lamps + HUD | Controller key state, target, frame/time |
 
 Useful options: `--index N` (which matched pair), `--fps` (should match training
 fps), `--scale` (output upscale), `--conf` (detector confidence). Requires the
-trained detector (`runs/detect/train/weights/best.pt`) and action model
-(`runs/action/best.pth`); if the action model is missing it overlays detections
-only.
+trained detector (`runs/detect/train/weights/best.pt`); the controller needs no
+weights.
 
 ### Optional — TensorRT export
 
@@ -321,11 +327,12 @@ trtexec --onnx=runs\detect\train\weights\best.onnx ^
 
 | Component | Architecture | Parameters | Input | Output |
 |-----------|-------------|-----------|-------|--------|
-| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 5-class bounding boxes |
-| Approach Estimator | Geometric CV (no model) | 0 | full frame + bbox | approach_ratio [0, 1] |
-| Action Model | GRU (2-layer) | 858K | 133-dim state vector | (dx, dy, key_z, key_x) |
+| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 7-class bounding boxes |
+| Approach Estimator | Ring-box geometry (no model) | 0 | detections | approach_ratio [0, 1] |
+| Controller | Deterministic state machine | 0 | detections + ratios | cursor target + (key_z, key_x) |
 
-Detection classes: `hitcircle`(0), `slider_head`(1), `slider_body`(2), `slider_end`(3), `spinner`(4).
+Detection classes: `hitcircle`(0), `slider_head`(1), `slider_body`(2),
+`slider_end`(3), `spinner`(4), `approach_circle`(5), `slider_ball`(6).
 
 ## Coordinate System
 

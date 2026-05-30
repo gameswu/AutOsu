@@ -28,6 +28,8 @@ class ObjClass(IntEnum):
     SLIDER_BODY = 2
     SLIDER_END = 3
     SPINNER = 4
+    APPROACH_CIRCLE = 5  # expanding ring; box size encodes approach_ratio
+    SLIDER_BALL = 6      # moving follow target during an active slider
 
 
 @dataclass
@@ -89,6 +91,14 @@ class FrameDetections:
     @property
     def spinners(self) -> List[Detection]:
         return [d for d in self.detections if d.cls == ObjClass.SPINNER]
+
+    @property
+    def approach_circles(self) -> List[Detection]:
+        return [d for d in self.detections if d.cls == ObjClass.APPROACH_CIRCLE]
+
+    @property
+    def slider_balls(self) -> List[Detection]:
+        return [d for d in self.detections if d.cls == ObjClass.SLIDER_BALL]
 
     @property
     def actionable_objects(self) -> List[Detection]:

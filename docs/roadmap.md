@@ -1,6 +1,6 @@
 # AutOsu Development Roadmap
 
-Vision-based osu! std AI player — fully learned control (no heuristic trajectories).
+Vision-based osu! std AI player — learned detection + deterministic vision-only control.
 
 ---
 
@@ -57,16 +57,17 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 - [x] Tested: 9000 frames, 0 errors, ~200 fps on test data
 
 ### 2b — Dataset Generator (`scripts/generate_dataset.py`)
-- [x] Unified pipeline: .osu + .osr → YOLO images + approach crops + action sequences
+- [x] Unified pipeline: .osu + .osr → YOLO images + labels (7 classes)
 - [x] Uses osr2mp4 renderer for pixel-perfect frame generation
 - [x] Cursor + trail rendered from replay data (so YOLO learns to ignore it)
-- [x] YOLO labels generated from osr2mp4 beatmap hit objects
+- [x] YOLO labels generated from osr2mp4 beatmap hit objects, incl. approach
+      circle (class 5, ring scale 4→1) and slider ball (class 6, ping-pong path)
 - [x] Stacked note deduplication
+- [x] Class-balanced train split (oversample rare-class frames) + histogram
 - [x] Configurable FPS, max_beatmaps (post-filter), train/val split
 - [x] Outputs:
   - `dataset/images/` + `dataset/labels/` (YOLO format)
-  - `dataset/sequences/` (.npz state/action pairs)
-  - `dataset/data.yaml`
+  - `dataset/data.yaml` (7 classes)
 
 ### 2c — Data Preparation (`scripts/prepare_data.py`)
 - [x] Automatic `.osz` extraction to `beatmaps/` subdirectories
@@ -87,34 +88,35 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 ## Phase 3 — Vision Models [done]
 
 ### 3a — Object Detector (`src/vision/detector.py`)
-- [x] YOLOv8-nano, 5 classes, 640x384 input
+- [x] YOLOv8-nano, 7 classes, 640x384 input
 - [x] Training script (`scripts/train_detector.py`)
 - [x] ONNX export built into training pipeline
 - [ ] TensorRT FP16 export + benchmark
 
-### 3b — Approach Estimator (`src/vision/approach_geometry.py`)
-- [x] Geometric CV: polar-unwrap around each object, read approach-ring radius
-- [x] `ratio = (4.0 - r_ring/r_disc) / 3.0`, self-calibrating, no model/GPU/crops
-- [x] Temporal linear-fit: objects are static and the ring shrinks at a constant
-      rate, so a global shrink-rate slope is pooled across all objects and each
-      object only needs its phase; monotonic-drop detection handles recycled
-      positions (stacked/streamed notes). Overall ratio MAE 0.18 → 0.13.
+### 3b — Approach Estimator
+- [x] **Primary** (`src/vision/approach_from_boxes.py`): pair each detected
+      approach-circle box with its hitcircle/slider-head; `ratio = (4 - r_ring/R_disc)/3`,
+      optional temporal global-slope fit; no ring ⇒ ratio 1.0
+- [x] **Fallback** (`src/vision/approach_geometry.py`): geometric CV, polar-unwrap
+      around each object, read approach-ring radius; temporal linear-fit
+      (overall ratio MAE 0.18 → 0.13)
 - [x] Validation mode: `debug_action.py approach-geo` (vs ground-truth timing ratio)
 - [x] Replaced the old 63K-param CNN (poor calibration on small 64×64 crops)
 
 ---
 
-## Phase 4 — Action Model [done]
+## Phase 4 — Controller [done]
 
-### 4a — State/Action Definition (`src/action/state.py`)
-- [x] GameStateVector: 16 objects × 8 features + cursor(4) + time_delta(1) = 133 dims
-- [x] ActionVector: (dx, dy, key_z, key_x) normalised
-- [x] Consistent format between offline training and online inference
+### 4a — Online Timing Tracker (`src/control/tracker.py`)
+- [x] Per-object approach-ratio → time-to-hit estimate, EMA-smoothed preempt
+- [x] Pure vision, no beatmap parsing
 
-### 4b — GRU Policy Network (`src/action/model.py`)
-- [x] 858K-param GRU (2 layers, hidden=256)
-- [x] Stateful inference wrapper (maintains hidden state across frames)
-- [x] Training script with MSE + BCE loss (`scripts/train_action.py`)
+### 4b — Deterministic Controller (`src/control/{planner,motion,controller}.py`)
+- [x] Scene building + most-imminent target selection (`planner.py`)
+- [x] Human-like min-jerk motion + damped follow + tapered jitter (`motion.py`)
+- [x] State machine: approach/tap → slide (reactive ball follow) → spin sweep,
+      Z/X alternation (`controller.py`)
+- [x] Zero learned parameters; replaced the behavioral-cloning GRU
 
 ---
 
@@ -130,7 +132,7 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 - [x] MockInjector for observe mode
 
 ### 5c — Game Pipeline (`src/runtime/pipeline.py`)
-- [x] Full loop: capture → detect → approach → state → action → inject
+- [x] Full loop: capture → detect → approach → controller → inject
 - [x] Configurable FPS target
 - [x] Graceful start/stop
 
@@ -158,20 +160,16 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 ### 6b — Training Pipeline [next]
 - [ ] Collect raw data: 100+ `.osz` beatmaps + `.osr` replays across 2-5 star difficulty range
 - [ ] Run `prepare_data.py` to verify matching coverage
-- [ ] Generate full dataset with cursor rendering (~30-50K images)
-- [ ] Train detector to mAP50 > 0.9
-- [ ] Train approach estimator to MAE < 0.05
-- [ ] Train action model: cursor MAE < 10px, key accuracy > 85%
+- [ ] Generate full dataset with cursor rendering (~30-50K images, 7 classes, balanced)
+- [ ] Train detector to mAP50 > 0.9 (incl. approach_circle / slider_ball)
 - [ ] End-to-end test on easy maps (2-3 star)
 - [ ] Record and review AI gameplay for failure analysis
 
 ### 6c — Offline Inference Demo (`scripts/demo_inference.py`) [done]
 - [x] Re-renders a beatmap+replay and runs the full runtime stack per frame
-      (YOLO → geometric approach → GRU action) without launching osu!
-- [x] Annotated MP4 output: detection boxes + approach ratios, model cursor
+      (YOLO → ring-box approach → deterministic controller) without launching osu!
+- [x] Annotated MP4 output: detection boxes + approach ratios, controller cursor
       (red, with trail) vs human/replay cursor (green), Z/X key lamps + HUD
-- [x] Closed-loop (autoregressive, shows BC drift) and `--teacher-forcing`
-      (open-loop, per-step accuracy) modes
 - [x] Reuses the shared `open_replay_frames()` render factory (one render frame
       = one inference step; render fps should match training fps)
 
@@ -189,8 +187,10 @@ Vision-based osu! std AI player — fully learned control (no heuristic trajecto
 
 ## Dropped / Superseded
 
-- ~~Bezier trajectory generation~~ → replaced by learned GRU action model
-- ~~Rule-based controller~~ → fully learned from replays
+- ~~Bezier trajectory generation~~ → replaced by deterministic min-jerk controller
+- ~~GRU behavioral-cloning action model~~ → replaced by deterministic vision-only
+  controller (BC drifted, suffered covariate shift, and was slider-blind)
+- ~~`.npz` state/action sequences~~ → no longer generated (no action model)
 - ~~.env configuration~~ → unified in `configs/default.yaml`
 - ~~C++ pybind11 input module~~ → ctypes SendInput is sufficient at 1000Hz
 - ~~Manual .osu/.osr pairing by filename~~ → replaced by automatic MD5 hash matching

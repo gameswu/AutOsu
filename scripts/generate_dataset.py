@@ -2,9 +2,10 @@
 """
 Generate training data from raw_data/ (beatmaps + replays).
 
-Produces:
-  1. YOLO detection dataset (images + labels) -- with cursor rendered
-  2. Action model sequences (state_vector, action) pairs as .npz
+Produces a YOLO detection dataset (images + labels) with the cursor rendered.
+Classes: 0 hitcircle, 1 slider_head, 2 slider_body, 3 slider_end, 4 spinner,
+5 approach_circle (ring; box size encodes approach ratio), 6 slider_ball
+(moving follow target during an active slider).
 
 Input data structure::
 
@@ -127,6 +128,10 @@ def main():
                         help="Train/val split ratio (default: 0.85)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--no-balance", action="store_true",
+                        help="Disable class-balancing oversampling of the train split")
+    parser.add_argument("--balance-max-factor", type=int, default=8,
+                        help="Max number of duplicates per image when balancing (default: 8)")
     args = parser.parse_args()
 
     from src.data.replay_parser import find_replay_pairs
@@ -152,14 +157,12 @@ def main():
     (out / "images" / "val").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "train").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "val").mkdir(parents=True, exist_ok=True)
-    (out / "sequences").mkdir(parents=True, exist_ok=True)
 
     # Coordinate transform for YOLO labels
     tf = PlayfieldTransform(args.width, args.height)
 
     random.seed(args.seed)
     total_frames = 0
-    total_sequences = 0
 
     for pair_idx, (osu_path, osr_paths) in enumerate(pairs):
         print(f"\n[{pair_idx+1}/{len(pairs)}] {osu_path.parent.name}/{osu_path.name}")
@@ -181,20 +184,10 @@ def main():
             is_train = random.random() < args.train_ratio
             split = "train" if is_train else "val"
 
-            # Action sequence buffers
-            sequence_states = []
-            sequence_actions = []
-            prev_cx, prev_cy = 256.0, 192.0
-            prev_t_ms = 0.0
-
-            from src.action.state import GameStateVector, ActionVector
-
             for fd in frame_iter:
                 frame, t_ms, frame_idx = fd["frame"], fd["t_ms"], fd["frame_idx"]
                 visible = fd["visible"]
                 time_preempt, radius_osu = fd["time_preempt"], fd["radius_osu"]
-                cursor_x, cursor_y = fd["cursor_x"], fd["cursor_y"]
-                key_z, key_x = fd["key_z"], fd["key_x"]
 
                 if visible:
                     # Generate YOLO labels
@@ -213,52 +206,23 @@ def main():
                             f.write("\n".join(labels))
                         total_frames += 1
 
-                # Build state/action for action model
-                dt_ms = t_ms - prev_t_ms
-                objects = _build_object_states(visible, t_ms, time_preempt)
-                vx = (cursor_x - prev_cx) / max(1, dt_ms) if dt_ms > 0 else 0
-                vy = (cursor_y - prev_cy) / max(1, dt_ms) if dt_ms > 0 else 0
-
-                state = GameStateVector(
-                    objects=objects,
-                    cursor_x=prev_cx, cursor_y=prev_cy,
-                    cursor_vx=vx, cursor_vy=vy,
-                    time_delta_ms=dt_ms,
-                )
-                action = ActionVector(
-                    dx=cursor_x - prev_cx,
-                    dy=cursor_y - prev_cy,
-                    key_z=key_z,
-                    key_x=key_x,
-                )
-
-                sequence_states.append(state.to_numpy())
-                sequence_actions.append(action.to_numpy())
-
-                prev_cx, prev_cy = cursor_x, cursor_y
-                prev_t_ms = t_ms
-
                 if frame_idx % 500 == 0:
                     print(f"    frame {frame_idx}, t={t_ms:.0f}ms, "
                           f"imgs={total_frames}")
 
-            # Save sequence
-            if sequence_states:
-                seq_name = f"seq_{pair_idx:04d}_{osr_paths.index(osr_path):02d}.npz"
-                np.savez_compressed(
-                    str(out / "sequences" / seq_name),
-                    states=np.array(sequence_states, dtype=np.float32),
-                    actions=np.array(sequence_actions, dtype=np.float32),
-                )
-                total_sequences += 1
+    # Class-balance the train split by oversampling rare-class images
+    if not args.no_balance:
+        _balance_train_split(out, max_factor=args.balance_max_factor)
 
     # Write YOLO data.yaml
     _write_data_yaml(out)
 
+    # Report final class distribution
+    _print_class_histogram(out)
+
     print(f"\n{'=' * 60}")
     print(f"Dataset generation complete:")
     print(f"  Frames: {total_frames}")
-    print(f"  Sequences: {total_sequences}")
     print(f"  Output: {out.resolve()}")
 
 
@@ -276,8 +240,17 @@ def _obj_kind(obj):
 
 
 def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
-    """Generate YOLO label lines from visible osr2mp4 hit objects."""
+    """Generate YOLO label lines from visible osr2mp4 hit objects.
+
+    Classes emitted:
+        0 hitcircle, 1 slider_head, 2 slider_body, 3 slider_end, 4 spinner,
+        5 approach_circle (only while approaching, t_ms < obj time),
+        6 slider_ball (only while the slider is actively being followed).
+    """
     lines = []
+    half_disc_w = (radius_osu * 2 * tf.playfieldscale) / w
+    half_disc_h = (radius_osu * 2 * tf.playfieldscale) / h
+
     for obj in visible:
         kind = _obj_kind(obj)
         ox, oy = obj["x"], obj["y"]
@@ -286,15 +259,19 @@ def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
         rx, ry = tf.osu_to_render(ox, oy)
         cx_n = rx / w
         cy_n = ry / h
-        bw_n = (radius_osu * 2 * tf.playfieldscale) / w
-        bh_n = (radius_osu * 2 * tf.playfieldscale) / h
+        bw_n = half_disc_w
+        bh_n = half_disc_h
 
         if kind == "circle":
             lines.append(f"0 {cx_n:.6f} {cy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
+            _append_approach_ring(lines, obj, t_ms, time_preempt, radius_osu,
+                                  rx, ry, tf, w, h)
 
         elif kind == "slider":
             # Slider head
             lines.append(f"1 {cx_n:.6f} {cy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
+            _append_approach_ring(lines, obj, t_ms, time_preempt, radius_osu,
+                                  rx, ry, tf, w, h)
 
             # Slider body bounding box
             slider_c = obj.get("slider_c")
@@ -319,6 +296,14 @@ def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
             ecy_n = ery / h
             lines.append(f"3 {ecx_n:.6f} {ecy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
 
+            # Slider ball (moving follow point during active slide)
+            ball = _slider_ball_pos(obj, t_ms)
+            if ball is not None:
+                brx, bry = tf.osu_to_render(ball[0], ball[1])
+                lines.append(
+                    f"6 {brx / w:.6f} {bry / h:.6f} {half_disc_w:.6f} {half_disc_h:.6f}"
+                )
+
         elif kind == "spinner":
             # Spinner centered at playfield center
             scx, scy = tf.osu_to_render(256, 192)
@@ -327,41 +312,53 @@ def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
     return list(dict.fromkeys(lines))
 
 
-def _approach_ratio(parts, t_ms, visible, time_preempt):
-    """Compute approach_ratio for a YOLO label by matching to visible objects."""
-    cls_id = int(parts[0])
-    for obj in visible:
-        kind = _obj_kind(obj)
-        if cls_id == 0 and kind == "circle":
-            dt = t_ms - (obj["time"] - time_preempt)
-            return min(1.0, max(0.0, dt / time_preempt)) if time_preempt > 0 else 1.0
-        elif cls_id == 1 and kind == "slider":
-            dt = t_ms - (obj["time"] - time_preempt)
-            return min(1.0, max(0.0, dt / time_preempt)) if time_preempt > 0 else 1.0
-    return 0.5
+def _append_approach_ring(lines, obj, t_ms, time_preempt, radius_osu,
+                          rx, ry, tf, w, h):
+    """Emit a class-5 approach_circle label for an approaching hit object.
+
+    The ring shrinks linearly from 4x the disc radius (just appeared) to 1x
+    (hit time), matching osu!lazer's ``Scale=4 -> 1`` over TimePreempt. We only
+    label it while it is actually larger than the disc (still approaching).
+    """
+    if time_preempt <= 0:
+        return
+    appear = obj["time"] - time_preempt
+    dt = t_ms - appear
+    ratio = dt / time_preempt
+    if ratio < 0.0 or ratio >= 1.0:
+        return  # not visible yet, or already collapsed onto the disc
+    scale = 4.0 - 3.0 * ratio           # 4 -> 1
+    ring_w = (radius_osu * 2 * scale * tf.playfieldscale) / w
+    ring_h = (radius_osu * 2 * scale * tf.playfieldscale) / h
+    lines.append(f"5 {rx / w:.6f} {ry / h:.6f} {ring_w:.6f} {ring_h:.6f}")
 
 
-def _build_object_states(visible, t_ms, time_preempt):
-    """Convert visible osr2mp4 hit objects to ObjectState list."""
-    from src.action.state import ObjectState
+def _slider_ball_pos(obj, t_ms):
+    """Position [x, y] (osu! coords) of the slider ball at time t_ms, or None.
 
-    objects = []
-    for obj in visible:
-        dt = t_ms - (obj["time"] - time_preempt)
-        ratio = min(1.0, max(0.0, dt / time_preempt)) if time_preempt > 0 else 1.0
+    Mirrors osr2mp4's slider traversal: the ball walks the curve once per
+    repeat, reversing direction on odd repeats (ping-pong).
+    """
+    if _obj_kind(obj) != "slider":
+        return None
+    slider_c = obj.get("slider_c")
+    duration = obj.get("duration", 0)
+    repeated = obj.get("repeated", 1)
+    pixel_length = obj.get("pixel length")
+    if not slider_c or duration <= 0 or pixel_length is None:
+        return None
 
-        kind = _obj_kind(obj)
-        if kind == "circle":
-            objects.append(ObjectState(class_id=0, x=obj["x"], y=obj["y"],
-                                       approach_ratio=ratio))
-        elif kind == "slider":
-            objects.append(ObjectState(class_id=1, x=obj["x"], y=obj["y"],
-                                       approach_ratio=ratio))
-        elif kind == "spinner":
-            objects.append(ObjectState(class_id=4, x=256, y=192,
-                                       approach_ratio=ratio))
+    start = obj["time"]
+    end_time = start + duration * repeated
+    if t_ms < start or t_ms > end_time:
+        return None
 
-    return objects
+    elapsed = t_ms - start
+    repeat_idx = min(int(elapsed // duration), repeated - 1)
+    frac = (elapsed - repeat_idx * duration) / duration
+    if repeat_idx % 2 == 1:
+        frac = 1.0 - frac
+    return slider_c.at(frac * pixel_length)
 
 
 def _write_data_yaml(out: Path):
@@ -370,17 +367,130 @@ def _write_data_yaml(out: Path):
         "path": str(out.resolve()),
         "train": "images/train",
         "val": "images/val",
-        "nc": 5,
+        "nc": 7,
         "names": {
             0: "hitcircle",
             1: "slider_head",
             2: "slider_body",
             3: "slider_end",
             4: "spinner",
+            5: "approach_circle",
+            6: "slider_ball",
         },
     }
     with open(out / "data.yaml", "w") as f:
         yaml.dump(data, f, default_flow_style=False)
+
+
+_CLASS_NAMES = [
+    "hitcircle", "slider_head", "slider_body", "slider_end",
+    "spinner", "approach_circle", "slider_ball",
+]
+
+
+def _label_class_counts(label_path: Path) -> dict:
+    """Return {class_id: instance_count} for a single YOLO label file."""
+    counts: dict = {}
+    try:
+        with open(label_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                cid = int(line.split()[0])
+                counts[cid] = counts.get(cid, 0) + 1
+    except OSError:
+        pass
+    return counts
+
+
+def _scan_class_instances(label_dir: Path):
+    """Aggregate per-class instance counts across every label file in a dir."""
+    totals: dict = {}
+    for lbl in label_dir.glob("*.txt"):
+        for cid, n in _label_class_counts(lbl).items():
+            totals[cid] = totals.get(cid, 0) + n
+    return totals
+
+
+def _balance_train_split(out: Path, max_factor: int = 8):
+    """Oversample rare-class images in the train split until classes balance.
+
+    Detection labels are multi-class per image, so we cannot drop images
+    without losing common-class instances. Instead we duplicate (oversample)
+    images that contain under-represented classes. Each image is replicated by
+    a factor driven by the rarest class it contains::
+
+        factor(image) = min(max_factor,
+                            ceil(max over classes c in image of target / count[c]))
+
+    where ``target`` is the most common class's instance count. Duplicated
+    files are written with an ``_balN`` suffix so they survive a re-run cleanly
+    (existing ``_bal*`` copies are purged first).
+    """
+    img_dir = out / "images" / "train"
+    lbl_dir = out / "labels" / "train"
+    if not lbl_dir.exists():
+        return
+
+    # Purge previous balancing duplicates (idempotent re-runs)
+    for p in img_dir.glob("*_bal*.jpg"):
+        p.unlink()
+    for p in lbl_dir.glob("*_bal*.txt"):
+        p.unlink()
+
+    totals = _scan_class_instances(lbl_dir)
+    if not totals:
+        return
+    target = max(totals.values())
+
+    print(f"\n[balance] pre-balance instances: "
+          + ", ".join(f"{_CLASS_NAMES[c]}={totals.get(c, 0)}"
+                      for c in range(len(_CLASS_NAMES))))
+
+    import math
+    import shutil
+
+    added = 0
+    for lbl in sorted(lbl_dir.glob("*.txt")):
+        if "_bal" in lbl.stem:
+            continue
+        counts = _label_class_counts(lbl)
+        if not counts:
+            continue
+        # Replication driven by the rarest class present in this image
+        factor = 1
+        for cid in counts:
+            c = totals.get(cid, 0)
+            if c > 0:
+                factor = max(factor, math.ceil(target / c))
+        factor = min(factor, max_factor)
+        if factor <= 1:
+            continue
+
+        img = img_dir / f"{lbl.stem}.jpg"
+        if not img.exists():
+            continue
+        for k in range(1, factor):
+            shutil.copyfile(img, img_dir / f"{lbl.stem}_bal{k}.jpg")
+            shutil.copyfile(lbl, lbl_dir / f"{lbl.stem}_bal{k}.txt")
+            added += 1
+
+    print(f"[balance] added {added} oversampled copies (max_factor={max_factor})")
+
+
+def _print_class_histogram(out: Path):
+    """Print per-class instance counts for the train and val splits."""
+    for split in ("train", "val"):
+        lbl_dir = out / "labels" / split
+        if not lbl_dir.exists():
+            continue
+        totals = _scan_class_instances(lbl_dir)
+        total = sum(totals.values()) or 1
+        print(f"\n[{split}] class instances ({total} total):")
+        for c in range(len(_CLASS_NAMES)):
+            n = totals.get(c, 0)
+            print(f"    {c} {_CLASS_NAMES[c]:<16} {n:>8}  ({100*n/total:5.1f}%)")
 
 
 if __name__ == "__main__":

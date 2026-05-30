@@ -59,7 +59,6 @@ def main():
 
     pipeline_cfg = PipelineConfig(
         detector_path=cfg.get("detector_path", "runs/detect/train/weights/best.pt"),
-        action_model_path=cfg.get("action_model_path", "runs/action/best.pth"),
         device=args.device or cfg.get("device", "cuda:0"),
         conf_threshold=cfg.get("conf_threshold", 0.3),
         iou_threshold=cfg.get("iou_threshold", 0.45),
@@ -67,8 +66,11 @@ def main():
         model_input_h=cfg.get("model_input_h", 384),
         use_dxcam=cfg.get("use_dxcam", True),
         target_fps=cfg.get("target_fps", 120),
-        action_fps=cfg.get("action_fps", cfg.get("data", {}).get("fps", 30)),
-        key_threshold=cfg.get("key_threshold", 0.5),
+        hit_window=cfg.get("hit_window", 0.90),
+        hit_radius_osu=cfg.get("hit_radius_osu", 80.0),
+        tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
+        spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
+        motion_jitter=cfg.get("motion_jitter", 1.2),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 
@@ -89,9 +91,8 @@ def main():
         pipeline.initialize(injector=injector)
     except FileNotFoundError as e:
         print(f"\n[ERROR] {e}")
-        print("Make sure you have trained the models first:")
+        print("Make sure you have trained the detector first:")
         print("  python scripts/train_detector.py")
-        print("  python scripts/train_action.py")
         sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] Initialization failed: {e}")
