@@ -116,6 +116,19 @@ def _make_settings(
     gameplay["Global leaderboard"] = False
     settings.settings = gameplay
 
+    # Counter fonts: the bundled config points at the Windows system font
+    # "arial.ttf", which does not exist on Linux. PIL then raises
+    # OSError('cannot open resource') per counter (PP + Hitresult) before
+    # falling back to res/Aller_Rg.ttf — harmless but noisy on every replay.
+    # Point both counter fonts at the font shipped in res/ so truetype
+    # succeeds on the first try on every OS (copy first to avoid mutating the
+    # shared module-level defaultppconfig dict).
+    bundled_font = os.path.join(settings.path, "res", "Arial.ttf")
+    ppsettings = dict(settings.ppsettings)
+    ppsettings["Font"] = bundled_font
+    ppsettings["Hitresult Font"] = bundled_font
+    settings.ppsettings = ppsettings
+
     return settings
 
 
