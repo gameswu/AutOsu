@@ -3,8 +3,8 @@ Real-time pipeline: capture -> detect -> estimate approach -> controller -> inje
 
 Runs at ~120Hz, orchestrating all components. The action is produced by the
 vision-only :class:`Controller`: a deterministic navigation goal + key state
-(the hard constraints) driven by a mandatory learned motion policy that
-produces the cursor velocity.
+(the hard constraints) plus a deterministic goal-seek for the cursor, with an
+optional learned style residual on top.
 """
 
 from __future__ import annotations
@@ -46,12 +46,15 @@ class PipelineConfig:
     tap_hold_ms: float = 40.0
     spin_radius_osu: float = 60.0
     slide_follow_radius_osu: float = 120.0
-    # Learned motion policy weights (from scripts/train_motion.py). REQUIRED —
-    # the controller has no deterministic motion fallback and will fail to
-    # initialise without a loadable policy.
+    # Deterministic seek (guarantees the cursor converges to the goal).
+    max_speed_osu_pms: float = 4.0    # seek speed cap
+    seek_tau_ms: float = 45.0         # seek time constant
+    # Optional learned style residual (from scripts/train_motion.py). Without it
+    # the cursor runs on the pure deterministic seek, which already plays
+    # accurately. When set, max_residual_osu_pms must match the trained net.
     motion_net_path: Optional[str] = None
-    max_speed_osu_pms: float = 4.0    # must match the trained policy / dataset
-    speed_scale: float = 1.0
+    max_residual_osu_pms: float = 1.5
+    style_scale: float = 1.0
 
 
 class GamePipeline:
@@ -122,20 +125,25 @@ class GamePipeline:
         self._approach_estimator.reset()
         print(f"[Pipeline] Approach estimator: YOLO approach_circle boxes + temporal fit")
 
-        # Vision-only controller: deterministic navigation goal + learned motion
-        # policy (the policy is mandatory).
+        # Vision-only controller: deterministic navigation goal + seek, with an
+        # optional learned style residual on top.
         self._controller = Controller(
             hit_window=self.config.hit_window,
             tap_hold_ms=self.config.tap_hold_ms,
             spin_radius_osu=self.config.spin_radius_osu,
             slide_follow_radius_osu=self.config.slide_follow_radius_osu,
-            motion_net_path=self.config.motion_net_path,
             max_speed_osu_pms=self.config.max_speed_osu_pms,
-            speed_scale=self.config.speed_scale,
+            seek_tau_ms=self.config.seek_tau_ms,
+            motion_net_path=self.config.motion_net_path,
+            max_residual_osu_pms=self.config.max_residual_osu_pms,
+            style_scale=self.config.style_scale,
             device=self.config.device,
         )
-        print(f"[Pipeline] Controller: navigation goal + learned motion policy "
-              f"(max_speed={self.config.max_speed_osu_pms} osu!px/ms)")
+        mode = ("seek + learned style residual" if self._controller.motion_net_active
+                else "deterministic seek (no style weights)")
+        print(f"[Pipeline] Controller: navigation goal + {mode} "
+              f"(max_speed={self.config.max_speed_osu_pms} osu!px/ms, "
+              f"tau={self.config.seek_tau_ms} ms)")
 
         # Screen capture
         region = self._mapping.capture_region

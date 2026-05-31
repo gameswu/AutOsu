@@ -83,12 +83,15 @@ def cmd_live(args):
         spin_radius_osu=ctrl_cfg.get("spin_radius_osu", 60.0),
         spin_speed=ctrl_cfg.get("spin_speed", 0.025),
         slide_follow_radius_osu=ctrl_cfg.get("slide_follow_radius_osu", 120.0),
-        motion_net_path=ctrl_cfg.get("motion_net_path", None),
         max_speed_osu_pms=ctrl_cfg.get("max_speed_osu_pms", 4.0),
-        speed_scale=ctrl_cfg.get("speed_scale", 1.0),
+        seek_tau_ms=ctrl_cfg.get("seek_tau_ms", 45.0),
+        motion_net_path=ctrl_cfg.get("motion_net_path", None),
+        max_residual_osu_pms=ctrl_cfg.get("max_residual_osu_pms", 1.5),
+        style_scale=ctrl_cfg.get("style_scale", 1.0),
         device=ctrl_cfg.get("device", "cuda:0"),
     )
-    print("[Live] Controller: deterministic target-point + path follower")
+    print("[Live] Controller: navigation goal + deterministic seek "
+          "(+ optional learned style)")
 
     # Cursor reader
     try:

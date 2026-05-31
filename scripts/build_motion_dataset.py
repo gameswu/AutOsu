@@ -4,22 +4,27 @@ Offline motion-policy dataset builder.
 
 Reconstructs the deterministic *navigation goal* frame-by-frame from beatmap
 ground truth (no rendering, geometry only), pairs it with the real human cursor
-from the matched replay, and records the supervised target — the **human cursor
-velocity** (osu!px per ms)::
+from the matched replay, and records the supervised target — the human cursor
+velocity **minus the deterministic seek**, i.e. the *style residual* the runtime
+adds on top of :func:`src.control.motion_net.seek_velocity`::
 
-    velocity(t) = (human_cursor(t + dt) - human_cursor(t)) / dt
+    v_human(t) = (human_cursor(t + dt) - human_cursor(t)) / dt
+    v_ref(t)   = seek_velocity(goal(t), human_cursor(t))
+    residual(t)= clip(v_human(t) - v_ref(t), +/- max_residual)
 
 together with the goal-relative features the policy consumes
-(:func:`src.control.motion_net.build_features`). Velocity (not per-frame
-displacement) is the label so the policy is resampling-rate independent.
+(:func:`src.control.motion_net.build_features`). The residual (not the full
+velocity) is the label so the deterministic seek guarantees convergence and the
+net only learns the human *style* on top of it. Velocity units (osu!px/ms) make
+it resampling-rate independent.
 
 This runs **entirely offline** on matched (.osu, .osr) pairs. The runtime player
-never reads beatmaps or replays — this only distils *how* humans move toward the
-navigation goal into training data for ``scripts/train_motion.py``.
+never reads beatmaps or replays — this only distils *how* humans deviate from
+the straight seek into training data for ``scripts/train_motion.py``.
 
-Output is a ``.npz`` with ``features`` (N, FEATURE_DIM) and ``velocity`` (N, 2,
-osu!px/ms). Train with the **same** ``--max-speed`` the runtime ``MotionPolicy``
-uses (default 4.0 osu!px/ms).
+Output is a ``.npz`` with ``features`` (N, FEATURE_DIM) and ``residual`` (N, 2,
+osu!px/ms). Train with the **same** ``--max-residual`` / ``--max-speed`` /
+``--seek-tau`` the runtime controller uses.
 
 Usage::
 
@@ -175,11 +180,11 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
 # ── driver ──────────────────────────────────────────────────────────────────
 
 def build(data_dir: str, fps: int, max_replays: Optional[int],
-          max_speed: float):
+          max_residual: float, max_speed: float, seek_tau: float):
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
     from src.control.reference import ReferenceController
-    from src.control.motion_net import build_features
+    from src.control.motion_net import build_features, seek_velocity
 
     pairs = find_replay_pairs(data_dir)
     if not pairs:
@@ -188,7 +193,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
 
     dt = 1000.0 / float(fps)
     feats_all: List[List[float]] = []
-    vel_all: List[Tuple[float, float]] = []
+    resid_all: List[Tuple[float, float]] = []
     n_replays = 0
 
     for osu_path, osr_paths in pairs:
@@ -233,10 +238,15 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
                 scene, start_idx = _scene_at(objs, start_idx, t)
                 ref = rc.step(scene, cur, t)
                 if ref.phase != "idle":
-                    vx = max(-max_speed, min(max_speed, (nxt[0] - cur[0]) / dt))
-                    vy = max(-max_speed, min(max_speed, (nxt[1] - cur[1]) / dt))
+                    # Human velocity minus the deterministic seek -> style residual.
+                    vhx = (nxt[0] - cur[0]) / dt
+                    vhy = (nxt[1] - cur[1]) / dt
+                    vrx, vry = seek_velocity((ref.x, ref.y), cur,
+                                             max_speed, seek_tau)
+                    rx = max(-max_residual, min(max_residual, vhx - vrx))
+                    ry = max(-max_residual, min(max_residual, vhy - vry))
                     feats_all.append(build_features(ref, cur, prev, dt))
-                    vel_all.append((vx, vy))
+                    resid_all.append((rx, ry))
                     kept += 1
                 prev = cur
                 t += dt
@@ -251,7 +261,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
         print("ERROR: no samples produced", file=sys.stderr)
         sys.exit(1)
 
-    return feats_all, vel_all, n_replays
+    return feats_all, resid_all, n_replays
 
 
 def main():
@@ -265,13 +275,20 @@ def main():
                     help="resampling rate for the reference simulation")
     ap.add_argument("--max-replays", "-n", type=int, default=None,
                     help="cap the number of replays processed")
+    ap.add_argument("--max-residual", type=float, default=1.5,
+                    help="clip |style residual| to this (osu!px/ms); MUST match "
+                         "training / MotionPolicy.max_residual_osu_pms")
     ap.add_argument("--max-speed", type=float, default=4.0,
-                    help="clip |velocity| to this (osu!px/ms); MUST match "
-                         "training / MotionPolicy.max_speed_osu_pms")
+                    help="deterministic seek speed cap (osu!px/ms); MUST match "
+                         "the runtime controller")
+    ap.add_argument("--seek-tau", type=float, default=45.0,
+                    help="deterministic seek time constant (ms); MUST match "
+                         "the runtime controller")
     args = ap.parse_args()
 
-    feats, vel, n_replays = build(args.data, args.fps, args.max_replays,
-                                  args.max_speed)
+    feats, resid, n_replays = build(args.data, args.fps, args.max_replays,
+                                    args.max_residual, args.max_speed,
+                                    args.seek_tau)
 
     import numpy as np
     out = Path(args.output)
@@ -279,15 +296,18 @@ def main():
     np.savez_compressed(
         out,
         features=np.asarray(feats, dtype=np.float32),
-        velocity=np.asarray(vel, dtype=np.float32),
+        residual=np.asarray(resid, dtype=np.float32),
+        max_residual=np.float32(args.max_residual),
         max_speed=np.float32(args.max_speed),
+        seek_tau=np.float32(args.seek_tau),
         fps=np.int32(args.fps),
     )
 
     print("\n── dataset ─────────────────────────────")
-    print(f"  replays   : {n_replays}")
-    print(f"  samples   : {len(feats)}")
-    print(f"  max_speed : {args.max_speed} osu!px/ms")
+    print(f"  replays      : {n_replays}")
+    print(f"  samples      : {len(feats)}")
+    print(f"  max_residual : {args.max_residual} osu!px/ms")
+    print(f"  max_speed    : {args.max_speed} osu!px/ms  (seek_tau={args.seek_tau} ms)")
     print(f"\nWrote {out}")
 
 

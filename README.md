@@ -12,20 +12,26 @@ Screen Capture   →  YOLOv8n Detect  →  Approach (ring box)  →  Controller 
 ```
 
 Detection is learned (YOLO); the player is **vision-only** and built as a
-**Constraint-Projected Residual Policy (CPRP)**:
+**deterministic goal-seek + optional learned style residual**:
 
 ```
-cursor(t) = reference(t) + gate(phase) · residual(t)
+goal(t), keys(t) = reference(scene)                          # geometry
+v_ref(t)         = seek_velocity(goal, cursor)               # converges (deterministic)
+v_style(t)       = policy.residual(goal-features)            # learned, bounded (optional)
+cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
 ```
 
-A deterministic *reference* layer owns timing and all hard constraints — min-jerk
-motion to the most imminent object, reactive slider-ball following, circular
-spinner sweep, and the actual taps — driven purely by the detected approach-circle
-box size. An **optional learned residual** (a small bounded, phase-gated MLP
-trained offline on real replays) then shapes *how* the cursor travels for a more
-human feel, without ever moving it off the object. With no trained weights the
-controller runs as the pure deterministic reference (min-jerk fallback), so there
-is no behavioral-cloning failure mode.
+A deterministic *reference* layer owns the hard constraints — the navigation
+goal (most imminent circle / slider-head / slider-ball / spinner sweep point)
+and the key state (taps and holds) — driven purely by the detected
+approach-circle box size. The cursor is moved in **velocity space**: a
+deterministic proportional **seek** that always points at the goal and decays on
+arrival, so the cursor is *mathematically guaranteed to converge* onto each
+object (no behavioural-cloning drift). An **optional** small `tanh`-bounded MLP
+adds a human-like *style residual* on top, gated to ~0 at the tap instant
+(`gate = 1 − approach_ratio`) so accuracy is never sacrificed for style. With no
+trained weights the cursor runs on the pure seek, which already plays
+accurately.
 
 ## Project Structure
 
@@ -60,10 +66,10 @@ AutOsu/
 │   ├── control/
 │   │   ├── tracker.py          # online timing tracker (approach-ratio → time-to-hit)
 │   │   ├── planner.py          # scene building + target selection
-│   │   ├── motion.py           # human-like min-jerk motion + smoothing
-│   │   ├── reference.py        # deterministic reference: approach/slide/spin + taps
-│   │   ├── motion_net.py       # learned bounded residual policy (CPRP)
-│   │   └── controller.py       # CPRP: reference + gate·residual → cursor target + keys
+│   │   ├── motion.py           # MotionProfile dataclass (offline analyze_motion only)
+│   │   ├── reference.py        # deterministic navigation goal + key state (taps/holds)
+│   │   ├── motion_net.py       # deterministic seek + optional learned style residual
+│   │   └── controller.py       # reference goal + seek + gated style → cursor target + keys
 │   └── runtime/
 │       ├── pipeline.py         # Main loop: capture→detect→approach→controller→inject
 │       ├── capture.py          # DXcam / mss screen capture
@@ -280,42 +286,32 @@ cursor target and key state. Inspect it live (capture only, no input injected):
 python scripts/debug_action.py live
 ```
 
-#### Optional — bake a human motion profile
+#### Optional — train the style residual
 
-The controller's *feel* (cursor tremor, overshoot, slider-follow tightness, and
-how early taps fire) can be tuned from real replays. This is a purely **offline**
-analysis — the runtime player never reads beatmaps or replays; it only loads the
-resulting numbers.
-
-```bash
-python scripts/analyze_motion.py --data raw_data --output configs/motion_profile.yaml
-```
-
-Then point the config at it (`motion_profile_path: configs/motion_profile.yaml`)
-to override `jitter` and supply `overshoot` / `follow_alpha` / `tap_lead_ms`.
-
-#### Optional — train the CPRP residual motion net
-
-For a learned (rather than hand-tuned) human feel, train the bounded residual
-layer offline on real replays. The reference is reconstructed from beatmap
-ground truth (geometry only, no rendering) and the net regresses
-`human − reference`; the runtime stays vision-only and falls back to the
-deterministic reference when no weights are present.
+The cursor already plays accurately on the deterministic seek alone. For a more
+human *feel*, train the optional style residual offline on real replays: the
+navigation goal is reconstructed from beatmap ground truth (geometry only, no
+rendering) and the net regresses the human cursor velocity **minus the
+deterministic seek**. The runtime itself stays vision-only.
 
 ```bash
-# 1) build the residual dataset (features + human deviation), on your server
+# 1) build the residual dataset (features + human-minus-seek velocity)
 python scripts/build_motion_dataset.py --data raw_data \
-    --output runs/motion/dataset.npz --max-residual 20
+    --output runs/motion/dataset.npz \
+    --max-residual 1.5 --max-speed 4.0 --seek-tau 45
 
 # 2) train the tanh-bounded MLP (use the SAME --max-residual)
 python scripts/train_motion.py --dataset runs/motion/dataset.npz \
-    --output runs/motion/motion_net.pt --max-residual 20
+    --output runs/motion/motion_net.pt --max-residual 1.5
 ```
 
-Then enable it in the config with `motion_net_path: runs/motion/motion_net.pt`
-(and a matching `max_residual_osu`). When active, the hand-made jitter/overshoot
-are disabled and the net shapes cursor motion via `cursor = reference +
-gate·residual`, never moving the cursor off the object.
+Then point the config at it with `motion_net_path: runs/motion/motion_net.pt`
+(and a matching `max_residual_osu_pms`, plus the same `max_speed_osu_pms` /
+`seek_tau_ms` used to build the dataset). The residual is added to the seek and
+faded out near each tap (`gate = 1 − approach_ratio`).
+
+> The offline `scripts/analyze_motion.py` (`MotionProfile`) is retained only as
+> a replay-statistics tool; the runtime controller no longer consumes it.
 
 ### Step 5 — Run the AI
 
@@ -380,8 +376,9 @@ trtexec --onnx=runs\detect\train\weights\best.onnx ^
 |-----------|-------------|-----------|-------|--------|
 | Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 5-class bounding boxes |
 | Approach Estimator | Ring-box geometry (no model) | 0 | detections | approach_ratio [0, 1] |
-| Reference (CPRP) | Deterministic state machine | 0 | detections + ratios | reference cursor + (key_z, key_x) |
-| Residual (CPRP) | Bounded MLP (`tanh`), optional | ~5K | reference-relative features (10) | gated cursor offset (≤ max_residual_osu) |
+| Reference | Deterministic geometry | 0 | detections + ratios | navigation goal + (key_z, key_x) |
+| Seek | Deterministic proportional seek | 0 | goal + cursor | converging cursor velocity (≤ max_speed_osu_pms) |
+| Style residual | MLP (`tanh`), **optional** | ~5K | goal-relative features (10) | bounded velocity residual (≤ max_residual_osu_pms), gated |
 
 Detection classes: `hitcircle`(0), `slider_head`(1), `slider_ball`(2),
 `spinner`(3), `approach_circle`(4). Sliders are labeled in two phases: a

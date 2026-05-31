@@ -1,21 +1,27 @@
 """
 Vision-only motion controller.
 
-Two layers, composed every frame::
+Three layers, composed every frame::
 
-    goal, keys      = ReferenceController(scene)        # deterministic geometry
-    cursor(t)       = cursor(t-1) + MotionPolicy.velocity(goal) * dt   # learned
+    goal, keys = ReferenceController(scene)              # deterministic geometry
+    v_ref      = seek_velocity(goal, cursor)             # deterministic, converges
+    v_style    = MotionPolicy.residual(goal-features)    # learned, bounded (optional)
+    cursor(t)  = cursor(t-1) + (v_ref + gate * v_style) * dt
 
 * :class:`~src.control.reference.ReferenceController` produces, purely from
   vision, the navigation goal (circle / slider-head / slider-ball / spin point)
   and the key state (the hard constraints — taps and holds).
-* :class:`~src.control.motion_net.MotionPolicy` produces the actual cursor
-  motion toward that goal. The policy is **mandatory** (trained weights are
-  required); there is no hand-coded motion fallback.
+* :func:`~src.control.motion_net.seek_velocity` is a deterministic proportional
+  seek that always points at the goal and decays on arrival, so the cursor is
+  *guaranteed to converge* (no behavioural-cloning drift).
+* :class:`~src.control.motion_net.MotionPolicy` adds an **optional**, bounded
+  style residual for human-like motion. ``gate = 1 - approach_ratio`` fades it
+  to ~0 at the tap instant and during slider/spinner contact, so accuracy is
+  never sacrificed for style. With no trained weights the cursor runs on the
+  pure seek (which already plays accurately).
 
-Keys come straight from the reference (the policy only moves the cursor, it
-never decides taps), so timing is owned by the deterministic layer while all
-human-like motion is owned by the learned policy.
+Keys come straight from the reference (the motion layer only moves the cursor,
+it never decides taps), so timing is owned by the deterministic layer.
 """
 
 from __future__ import annotations
@@ -25,7 +31,13 @@ from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
 from src.control.reference import ReferenceController, PHASE_IDLE, VK_Z, VK_X  # noqa: F401
-from src.control.motion_net import MotionPolicy, MAX_SPEED_OSU_PMS
+from src.control.motion_net import (
+    MotionPolicy,
+    seek_velocity,
+    MAX_SPEED_OSU_PMS,
+    MAX_RESIDUAL_OSU_PMS,
+    SEEK_TAU_MS,
+)
 
 Vec = Tuple[float, float]
 
@@ -47,17 +59,22 @@ class Controller:
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
         slide_follow_radius_osu: float = 120.0,  # match a ball within this of the slide point
-        motion_net_path: Optional[str] = None,   # REQUIRED learned policy weights
-        max_speed_osu_pms: float = MAX_SPEED_OSU_PMS,  # cap on commanded speed
-        speed_scale: float = 1.0,      # global speed gain
+        max_speed_osu_pms: float = MAX_SPEED_OSU_PMS,  # deterministic seek speed cap
+        seek_tau_ms: float = SEEK_TAU_MS,   # proportional seek time constant
+        motion_net_path: Optional[str] = None,   # OPTIONAL learned style residual
+        max_residual_osu_pms: float = MAX_RESIDUAL_OSU_PMS,  # style residual cap
+        style_scale: float = 1.0,      # global style-residual gain
         device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        # Learned motion policy (mandatory — raises if weights are missing).
+        self.max_speed = float(max_speed_osu_pms)
+        self.seek_tau_ms = float(seek_tau_ms)
+
+        # Learned style residual (optional — inactive without weights).
         self.policy = MotionPolicy(
             motion_net_path,
-            max_speed_osu_pms=max_speed_osu_pms,
-            scale=speed_scale,
+            max_residual_osu_pms=max_residual_osu_pms,
+            scale=style_scale,
             device=device,
         )
 
@@ -100,7 +117,16 @@ class Controller:
             # Nothing to navigate to — hold position.
             cmd_x, cmd_y = cursor
         else:
-            vx, vy = self.policy.velocity(ref, cursor, self._prev_cursor, dt_ms)
+            goal = (ref.x, ref.y)
+            # Deterministic seek guarantees convergence to the goal.
+            vx, vy = seek_velocity(goal, cursor, self.max_speed, self.seek_tau_ms)
+            # Optional learned style residual, faded out near the tap / during
+            # contact (ratio -> 1) so accuracy is preserved.
+            if self.policy.active:
+                rx, ry = self.policy.residual(ref, cursor, self._prev_cursor, dt_ms)
+                gate = max(0.0, 1.0 - ref.approach_ratio)
+                vx += gate * rx
+                vy += gate * ry
             cmd_x = cursor[0] + vx * dt_ms
             cmd_y = cursor[1] + vy * dt_ms
 

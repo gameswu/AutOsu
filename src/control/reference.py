@@ -10,10 +10,10 @@ vision scene, it emits two things:
 * the **key state** — the hard constraint (tap a circle, hold a slider / spin),
   decided from the approach ring.
 
-The actual cursor motion toward that goal is produced entirely by the learned
-:mod:`src.control.motion_net` policy (mandatory). There is deliberately **no
-hand-coded motion model here** — no min-jerk, jitter, overshoot, fixed reach
-time, or fixed dwell. Human-likeness comes only from the trained net.
+The actual cursor motion toward that goal is produced by the
+:mod:`src.control.motion_net` layer (a deterministic seek plus an optional
+learned style residual). There is deliberately **no hand-coded motion model
+here** — no min-jerk, jitter, overshoot, fixed reach time, or fixed dwell.
 
 Two entry points:
 

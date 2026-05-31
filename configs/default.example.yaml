@@ -25,14 +25,18 @@ hit_window: 0.90              # tap once approach_ratio >= this
 tap_hold_ms: 40.0            # how long a tap key stays held
 spin_radius_osu: 60.0        # spinner sweep radius
 slide_follow_radius_osu: 120.0   # max cursor->ball follow distance on sliders
-# Learned motion policy from scripts/train_motion.py. REQUIRED: the controller
-# has no deterministic motion fallback. The policy outputs cursor velocity
-# (osu!px/ms); cursor is integrated as cursor += velocity * dt each frame.
-# max_speed_osu_pms / speed_scale must match the value baked into the dataset
-# and used during training.
-motion_net_path: "runs/motion/motion_net.pt"
+# Deterministic seek toward the navigation goal. This alone guarantees the
+# cursor converges onto each object (cursor += seek_velocity * dt); smaller tau
+# is snappier, max_speed caps the seek velocity.
 max_speed_osu_pms: 4.0
-speed_scale: 1.0
+seek_tau_ms: 45.0
+# Optional learned style residual from scripts/train_motion.py. Adds human-like
+# deviation on top of the seek, faded to ~0 at the tap instant. Leave unset to
+# run on the pure (accurate) seek. max_residual_osu_pms must match the trained
+# net / dataset.
+# motion_net_path: "runs/motion/motion_net.pt"
+max_residual_osu_pms: 1.5
+style_scale: 1.0
 
 # ── Data generation (used by scripts/generate_dataset.py) ────────────────
 data:

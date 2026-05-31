@@ -70,9 +70,11 @@ def main():
         tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
         spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
         slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
-        motion_net_path=cfg.get("motion_net_path", None),
         max_speed_osu_pms=cfg.get("max_speed_osu_pms", 4.0),
-        speed_scale=cfg.get("speed_scale", 1.0),
+        seek_tau_ms=cfg.get("seek_tau_ms", 45.0),
+        motion_net_path=cfg.get("motion_net_path", None),
+        max_residual_osu_pms=cfg.get("max_residual_osu_pms", 1.5),
+        style_scale=cfg.get("style_scale", 1.0),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 

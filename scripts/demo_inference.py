@@ -64,8 +64,9 @@ def main():
                    help="Which matched (beatmap, replay) pair to use")
     p.add_argument("--skin", "-s", required=True, help="osu! skin directory")
     p.add_argument("--detector", default="runs/detect/train/weights/best.pt")
-    p.add_argument("--motion-net", default="runs/motion/motion_net.pt",
-                   help="learned motion policy weights (REQUIRED by the controller)")
+    p.add_argument("--motion-net", default=None,
+                   help="optional learned style-residual weights; omit to run "
+                        "on the pure deterministic seek")
     p.add_argument("--output", "-o", default="demo.mp4")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--width", type=int, default=640)

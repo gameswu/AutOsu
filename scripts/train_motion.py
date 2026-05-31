@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Train the neural motion policy.
+Train the motion-policy style residual.
 
-Supervised regression of the human cursor *velocity* (osu!px/ms) toward the
-navigation goal, on the dataset built by ``scripts/build_motion_dataset.py``::
+Supervised regression of the human cursor *style residual* (osu!px/ms) — the
+human velocity minus the deterministic seek — on the dataset built by
+``scripts/build_motion_dataset.py``::
 
-    target = velocity / max_speed                      # in [-1, 1]
+    target = residual / max_residual                   # in [-1, 1]
     loss   = MSE(net(features), target)
 
 The net is the same tiny MLP the runtime uses
@@ -13,9 +14,9 @@ The net is the same tiny MLP the runtime uses
 checkpoint is a plain ``state_dict`` loadable by
 :class:`src.control.motion_net.MotionPolicy`.
 
-IMPORTANT: train with the **same** ``--max-speed`` baked into the dataset and
-used by the runtime ``MotionPolicy`` (default 4.0 osu!px/ms), so the [-1, 1]
-network output maps back to the same speed scale.
+IMPORTANT: train with the **same** ``--max-residual`` baked into the dataset and
+used by the runtime ``MotionPolicy`` (default 1.5 osu!px/ms), so the [-1, 1]
+network output maps back to the same residual scale.
 
 Usage::
 
@@ -36,7 +37,7 @@ if _PROJECT_ROOT not in sys.path:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train the neural motion policy.")
+    ap = argparse.ArgumentParser(description="Train the motion-policy style residual.")
     ap.add_argument("--dataset", "-d", default="runs/motion/dataset.npz",
                     help="dataset .npz from build_motion_dataset.py")
     ap.add_argument("--output", "-o", default="runs/motion/motion_net.pt",
@@ -45,7 +46,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.1)
-    ap.add_argument("--max-speed", type=float, default=None,
+    ap.add_argument("--max-residual", type=float, default=None,
                     help="override; defaults to the value stored in the dataset")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -57,19 +58,19 @@ def main():
 
     data = np.load(args.dataset)
     feats = data["features"].astype("float32")
-    vel = data["velocity"].astype("float32")
+    resid = data["residual"].astype("float32")
     if feats.shape[1] != FEATURE_DIM:
         print(f"ERROR: dataset feature dim {feats.shape[1]} != FEATURE_DIM "
               f"{FEATURE_DIM}", file=sys.stderr)
         sys.exit(1)
-    max_speed = float(args.max_speed
-                      if args.max_speed is not None
-                      else data["max_speed"])
-    targets = np.clip(vel / max_speed, -1.0, 1.0).astype("float32")
+    max_residual = float(args.max_residual
+                         if args.max_residual is not None
+                         else data["max_residual"])
+    targets = np.clip(resid / max_residual, -1.0, 1.0).astype("float32")
 
     device = args.device if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device}  samples={len(feats)}  "
-          f"max_speed={max_speed} osu!px/ms")
+          f"max_residual={max_residual} osu!px/ms")
 
     # Split
     n = len(feats)
@@ -115,8 +116,8 @@ def main():
                     vl += loss_fn(net(xb), yb).item() * len(xb)
             val_loss = vl / max(1, n_val)
 
-        # RMS velocity error for an interpretable number.
-        rms = (val_loss ** 0.5) * max_speed
+        # RMS residual error for an interpretable number.
+        rms = (val_loss ** 0.5) * max_residual
         print(f"  epoch {epoch:3d}  train={tr_loss:.5f}  "
               f"val={val_loss:.5f}  (~{rms:.3f} osu!px/ms RMS)")
 
@@ -125,8 +126,8 @@ def main():
             torch.save(net.state_dict(), out)
 
     print(f"\nBest val MSE {best_val:.5f}  ->  {out}")
-    print("Set `motion_net_path` (and matching max_speed_osu) in your config "
-          "to enable the motion policy.")
+    print("Set `motion_net_path` (and matching max_residual_osu_pms) in your "
+          "config to enable the learned style residual.")
 
 
 if __name__ == "__main__":

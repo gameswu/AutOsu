@@ -1,24 +1,29 @@
 """
-Neural motion policy — the (mandatory) learned cursor driver.
+Motion layer — deterministic goal-seeking velocity + learned style residual.
 
 The deterministic :class:`~src.control.reference.ReferenceController` no longer
 *moves* the cursor. It only produces, every frame and purely from vision, the
 **navigation goal** (the circle / slider-head / slider-ball / spin-orbit point)
-and the **key state** (the hard constraints). All cursor motion — how fast and
-along what curve the cursor travels toward that goal — is produced by this
-learned policy::
+and the **key state** (the hard constraints). The cursor motion is composed
+here, in *velocity* space (so it is resampling-rate independent)::
 
-    cursor(t) = cursor(t-1) + velocity(features(t)) * dt
+    v_ref(t)   = seek_velocity(goal, cursor)              # guarantees convergence
+    v_style(t) = MotionPolicy.residual(features(t))       # learned, bounded
+    cursor(t)  = cursor(t-1) + (v_ref + gate * v_style) * dt
 
-There is **no hand-coded motion simulation** (no min-jerk, jitter, overshoot,
-dwell or fixed reach times) and **no deterministic fallback**: the policy
-requires trained weights. The network regresses the *human cursor velocity*
-(osu!px per ms) conditioned on goal-relative features, so it is resampling-rate
-independent — the same weights drive the cursor correctly at any runtime FPS.
+* **v_ref** — a simple proportional seek toward the goal, capped at a max speed.
+  It always points at the goal and shrinks as the cursor arrives, so the cursor
+  is *mathematically guaranteed* to converge (no covariate-shift drift). This is
+  reactive/self-correcting, not a pre-baked trajectory.
+* **v_style** — a small ``tanh``-bounded MLP that adds human-like deviation
+  (curved approach, micro-tremor, hesitation) on top of the seek. It is
+  **optional**: with no trained weights the cursor runs on the pure seek, which
+  already plays accurately. ``gate = 1 - approach_ratio`` fades the style to ~0
+  at the tap instant and during slider/spinner contact (ratio = 1), so accuracy
+  is never sacrificed for style.
 
 The features are goal-relative (phase one-hot, time-to-hit, the goal vector in
-the cursor frame, recent velocity) so the policy is largely self-correcting:
-even if the cursor drifts, the goal vector pulls it back. Train offline with
+the cursor frame, recent velocity). Train offline with
 ``scripts/build_motion_dataset.py`` + ``scripts/train_motion.py``; ``torch`` is
 imported lazily so this module imports fine on machines without it.
 """
@@ -49,12 +54,38 @@ _POS_NORM = 256.0        # osu!px half-playfield, normalises offsets to ~[-1, 1]
 _VEL_NORM_PMS = 1.5      # osu!px/ms, a brisk human flick
 _TTH_NORM_MS = 500.0     # ms; approach features saturate past half a second
 
-# Default cap on the commanded speed (osu!px per ms). The tanh output maps to
-# [-MAX_SPEED, MAX_SPEED]; MUST match the value baked into the training dataset.
-MAX_SPEED_OSU_PMS = 4.0
+# Deterministic seek: proportional time constant and the speed cap. v_ref =
+# clamp((goal - cursor) / SEEK_TAU_MS, max_speed). Smaller tau = snappier.
+SEEK_TAU_MS = 45.0
+MAX_SPEED_OSU_PMS = 4.0          # cap on the deterministic seek speed (osu!px/ms)
+
+# Learned style residual cap (osu!px/ms). The tanh output maps to
+# [-MAX_RESIDUAL, MAX_RESIDUAL]; MUST match the value baked into the dataset.
+MAX_RESIDUAL_OSU_PMS = 1.5
 
 # Hidden width of the policy MLP.
 HIDDEN_DIM = 64
+
+
+def seek_velocity(goal: Vec, cursor: Vec,
+                  max_speed: float = MAX_SPEED_OSU_PMS,
+                  tau_ms: float = SEEK_TAU_MS) -> Vec:
+    """Deterministic proportional seek toward ``goal`` (osu!px/ms).
+
+    Always points at the goal and decays as the cursor arrives, so integrating
+    ``cursor += seek_velocity(...) * dt`` is guaranteed to converge (critically
+    damped, no overshoot). The magnitude is capped at ``max_speed``.
+    """
+    dx = goal[0] - cursor[0]
+    dy = goal[1] - cursor[1]
+    tau = tau_ms if tau_ms > 1e-3 else SEEK_TAU_MS
+    vx, vy = dx / tau, dy / tau
+    speed = (vx * vx + vy * vy) ** 0.5
+    if speed > max_speed and speed > 1e-9:
+        s = max_speed / speed
+        vx *= s
+        vy *= s
+    return (vx, vy)
 
 
 def build_features(ref: Reference, cursor: Vec, prev_cursor: Vec,
@@ -105,25 +136,30 @@ def make_motion_net(in_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM):
 
 
 class MotionPolicyError(RuntimeError):
-    """Raised when the mandatory motion-policy weights cannot be loaded."""
+    """Raised when a *provided* motion-policy weights path cannot be loaded."""
 
 
 class MotionPolicy:
-    """Runtime wrapper: load weights, predict a bounded cursor velocity.
+    """Optional learned style residual on top of the deterministic seek.
 
-    Weights are **mandatory** — construction raises :class:`MotionPolicyError`
-    if the path is missing / unreadable or ``torch`` is unavailable. There is no
-    deterministic motion fallback by design.
+    Loads a trained MLP and predicts a bounded cursor-velocity *residual*
+    (osu!px/ms) that the controller adds — gated — to the deterministic
+    :func:`seek_velocity`. The policy is **optional**:
+
+    * ``path`` is ``None`` / empty  -> inactive (no error); the controller runs
+      on the pure deterministic seek, which already converges accurately.
+    * ``path`` is given but missing / unreadable, or ``torch`` is unavailable
+      -> :class:`MotionPolicyError` (a real misconfiguration, surfaced loudly).
     """
 
     def __init__(
         self,
         path: Optional[str],
-        max_speed_osu_pms: float = MAX_SPEED_OSU_PMS,
+        max_residual_osu_pms: float = MAX_RESIDUAL_OSU_PMS,
         scale: float = 1.0,
         device: str = "cpu",
     ):
-        self.max_speed = float(max_speed_osu_pms)
+        self.max_residual = float(max_residual_osu_pms)
         self.scale = float(scale)
         self.device = device
         self._net = None
@@ -137,10 +173,12 @@ class MotionPolicy:
     def load(self, path: Optional[str]) -> None:
         from pathlib import Path
         if not path:
-            raise MotionPolicyError(
-                "motion_net_path is required: a trained motion policy must be "
-                "provided (train one with scripts/train_motion.py). There is no "
-                "deterministic motion fallback.")
+            # Optional: no weights -> pure deterministic seek.
+            self._net = None
+            self._torch = None
+            print("[MotionPolicy] no weights -> deterministic seek only "
+                  "(no learned style)")
+            return
         p = Path(path)
         if not p.exists():
             raise MotionPolicyError(f"motion policy weights not found at {p}")
@@ -155,23 +193,25 @@ class MotionPolicy:
             net.to(self.device)
             self._torch = torch
             self._net = net
-            print(f"[MotionPolicy] loaded motion net: {p} "
-                  f"(max_speed={self.max_speed} osu!px/ms)")
+            print(f"[MotionPolicy] loaded style residual: {p} "
+                  f"(max_residual={self.max_residual} osu!px/ms)")
         except MotionPolicyError:
             raise
         except Exception as e:  # torch missing / bad checkpoint
             raise MotionPolicyError(
                 f"failed to load motion policy {p}: {e}") from e
 
-    def velocity(self, ref: Reference, cursor: Vec, prev_cursor: Vec,
+    def residual(self, ref: Reference, cursor: Vec, prev_cursor: Vec,
                  dt_ms: float) -> Vec:
-        """Commanded cursor velocity (osu!px/ms) for this frame."""
+        """Bounded style-residual velocity (osu!px/ms). (0, 0) if inactive."""
+        if self._net is None:
+            return (0.0, 0.0)
         feats = build_features(ref, cursor, prev_cursor, dt_ms)
         torch = self._torch
         with torch.no_grad():
             x = torch.tensor(feats, dtype=torch.float32,
                              device=self.device).unsqueeze(0)
             out = self._net(x)[0]
-            vx = float(out[0]) * self.max_speed * self.scale
-            vy = float(out[1]) * self.max_speed * self.scale
-        return (vx, vy)
+            rx = float(out[0]) * self.max_residual * self.scale
+            ry = float(out[1]) * self.max_residual * self.scale
+        return (rx, ry)

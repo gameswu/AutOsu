@@ -112,58 +112,70 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] Per-object approach-ratio → time-to-hit estimate, EMA-smoothed preempt
 - [x] Pure vision, no beatmap parsing
 
-### 4b — Deterministic Controller (`src/control/{planner,motion,controller}.py`)
+### 4b — Deterministic Reference (`src/control/{planner,reference,controller}.py`)
 - [x] Scene building + most-imminent target selection (`planner.py`)
-- [x] Human-like min-jerk motion + damped follow + tapered jitter (`motion.py`)
-- [x] State machine: approach/tap → slide (reactive ball follow) → spin sweep,
-      Z/X alternation (`controller.py`)
-- [x] Zero learned parameters; replaced the behavioral-cloning GRU
-- [x] Optional baked `MotionProfile` (jitter / overshoot / follow_alpha /
-      tap_lead_ms) extracted offline from real replays by
-      `scripts/analyze_motion.py`; loaded via `motion_profile_path` (runtime
-      stays vision-only — no replays/beatmaps read at play time)
+- [x] Navigation goal + key state only (`reference.py`): approach/tap → slide
+      (reactive ball follow, immediate release at slider end) → spin sweep,
+      Z/X alternation. **No hand-coded motion** (no min-jerk / jitter /
+      overshoot / dwell — those were removed per the no-simulation mandate).
+- [x] Zero learned parameters in the reference; replaced the behavioral-cloning GRU
+- [x] `src/control/motion.py` reduced to the `MotionProfile` dataclass, used only
+      by the offline `scripts/analyze_motion.py` replay-statistics tool (the
+      runtime controller no longer consumes it)
 
-### 4c — Learned Motion Net (CPRP) [implemented; weights pending]
+### 4c — Goal-Seek + Learned Style Residual [implemented; weights optional]
 
-A learned, human-like cursor layer that **cannot violate hard constraints**
-(must pass through hit circles / follow the ball / stay on the spin circle),
-unlike a raw behavioral-cloning policy. **Constraint-Projected Residual
-Policy (CPRP)**.
+Cursor motion is composed in *velocity* space: a deterministic seek that owns
+accuracy (guaranteed convergence) plus an optional learned residual that owns
+human-like style. Taps/timing can never drift because they are produced by the
+deterministic reference, and the cursor can never drift off-target because the
+seek always pulls it onto the goal — fixing the behavioural-cloning failure
+(smooth motion that misses objects) of a pure learned-velocity policy.
 
 ```
-cursor(t) = reference(t) + gate(phase) · residual(t)
+goal(t), keys(t) = reference(scene)                          # geometry
+v_ref(t)         = seek_velocity(goal, cursor)               # deterministic, converges
+v_style(t)       = policy.residual(goal-features)            # learned, bounded (optional)
+cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
 ```
 
 - **reference(t)** — `src/control/reference.py` (`ReferenceController`).
-  Recomputed every frame from the *current detections*: min-jerk interpolation
-  toward the most-imminent target (approach/tap), the detected follow-ball
-  (slide), or the circular sweep (spin). The old monolithic deterministic
-  controller logic now lives here; it guarantees the hard constraints and the
-  key/tap timing on its own.
-- **residual(t)** — `src/control/motion_net.py` (`ResidualPolicy` + a small
-  `tanh`-bounded **MLP**) over *reference-relative* features (phase one-hot,
-  time-to-hit, target vector in cursor frame, recent velocity; `FEATURE_DIM=10`,
-  shared by runtime and the dataset builder). Output is capped at
-  `max_residual_osu`; `gate(phase)` shrinks it to ~0 at the tap/contact instants
-  (scales with `1 − approach_ratio` while approaching) so accuracy is never
-  sacrificed for style. Keys come straight from the reference — the residual
-  only nudges the cursor.
+  Recomputed every frame from the *current detections*: the navigation goal
+  (most-imminent target for approach/tap, the detected follow-ball for slide, or
+  the circular sweep point for spin) plus the key/tap state. It guarantees the
+  hard constraints and the tap timing on its own; it does **not** move the cursor.
+- **v_ref(t)** — `src/control/motion_net.py` (`seek_velocity`). A proportional
+  seek `clamp((goal − cursor) / seek_tau_ms, max_speed_osu_pms)` that always
+  points at the goal and decays on arrival → integrating it is critically damped
+  and guaranteed to converge. Zero learned parameters; reactive, not a baked
+  trajectory.
+- **v_style(t)** — `src/control/motion_net.py` (`MotionPolicy` + a small
+  `tanh`-bounded **MLP**) over *goal-relative* features (phase one-hot,
+  approach_ratio, time-to-hit, goal vector in cursor frame, recent velocity;
+  `FEATURE_DIM=10`, shared by runtime and the dataset builder). Output is a
+  bounded velocity **residual** (osu!px/ms), `tanh × max_residual_osu_pms ×
+  style_scale`. **Optional**: no weights ⇒ pure seek (still accurate); a *given*
+  but unreadable path raises `MotionPolicyError`. `gate = 1 − approach_ratio`
+  fades it to ~0 at the tap instant and during slider/spinner contact (ratio=1),
+  so style never costs accuracy. Keys come straight from the reference.
 - **composition** — `src/control/controller.py` (`Controller`) keeps the same
-  public API (`update`/`reset`/`ControlOutput`). When the residual is active the
-  reference's hand-made jitter/overshoot are disabled (the net supplies human
-  deviation instead).
+  public API (`update`/`reset`/`ControlOutput`). Idle phase ⇒ cursor holds;
+  otherwise `cursor += (v_ref + gate·v_style)·dt`.
 - **training** — fully offline / supervised, run on your server:
-  `scripts/build_motion_dataset.py` reconstructs the reference frame-by-frame
-  from beatmap ground truth (geometry only, no rendering) under teacher forcing
-  and records `human − reference`; `scripts/train_motion.py` regresses the
-  bounded residual. No RL, no env rollouts.
-- **runtime** — vision-only; consumes only detections + phase. With **no
-  weights** the `ResidualPolicy` is inactive and the controller emits the pure
-  deterministic reference (min-jerk fallback).
-- **config** — `motion_net_path` + `max_residual_osu` (entry points
-  `autosu-build-motion-dataset`, `autosu-train-motion`).
-- [ ] (you) build dataset + train weights on the Linux server, then set
-  `motion_net_path`
+  `scripts/build_motion_dataset.py` reconstructs the reference goal
+  frame-by-frame from beatmap ground truth (geometry only, no rendering) and
+  records the human cursor velocity **minus the deterministic seek**,
+  `clip(v_human − v_ref, ±max_residual)`; `scripts/train_motion.py` regresses
+  `residual / max_residual`. No RL, no env rollouts.
+- **runtime** — vision-only; consumes only detections + phase. Runs with or
+  without weights (seek is the floor).
+- **config** — `max_speed_osu_pms` + `seek_tau_ms` (seek); optional
+  `motion_net_path` + `max_residual_osu_pms` + `style_scale` (style). Entry
+  points `autosu-build-motion-dataset`, `autosu-train-motion`. The dataset
+  builder, trainer and runtime must share the same `--max-residual` /
+  `--max-speed` / `--seek-tau`.
+- [ ] (you) build dataset + train style weights on the Linux server (optional;
+  the seek already plays), then set `motion_net_path`
 
 ---
 
@@ -234,7 +246,14 @@ cursor(t) = reference(t) + gate(phase) · residual(t)
 
 ## Dropped / Superseded
 
-- ~~Bezier trajectory generation~~ → replaced by deterministic min-jerk controller
+- ~~Bezier trajectory generation~~ → superseded by the deterministic velocity
+  seek (`seek_velocity`) toward the vision-derived navigation goal
+- ~~Hand-coded human-motion *simulation* (min-jerk / jitter / overshoot / fixed
+  dwell & reach timers)~~ → removed; human-likeness now comes from a learned,
+  bounded **style residual** on top of the deterministic seek (not hand-tuned
+  curves). The earlier "pure learned-velocity policy, no deterministic motion"
+  variant was reverted because it re-introduced behavioural-cloning drift
+  (smooth cursor that missed objects).
 - ~~GRU behavioral-cloning action model~~ → replaced by deterministic vision-only
   controller (BC drifted, suffered covariate shift, and was slider-blind)
 - ~~`.npz` state/action sequences~~ → no longer generated (no action model)
