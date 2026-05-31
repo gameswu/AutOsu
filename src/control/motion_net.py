@@ -9,7 +9,8 @@ here, in *velocity* space (so it is resampling-rate independent)::
 
     v_ref(t)   = seek_velocity(goal, cursor)              # guarantees convergence
     v_style(t) = MotionPolicy.residual(features(t))       # learned, bounded
-    cursor(t)  = cursor(t-1) + (v_ref + gate * v_style) * dt
+    v(t)       = accel_limit(v(t-1), v_ref + gate*v_style) # kinematic smoothing
+    cursor(t)  = cursor(t-1) + v(t) * dt
 
 * **v_ref** — a simple proportional seek toward the goal, capped at a max speed.
   It always points at the goal and shrinks as the cursor arrives, so the cursor
@@ -57,7 +58,17 @@ _TTH_NORM_MS = 500.0     # ms; approach features saturate past half a second
 # Deterministic seek: proportional time constant and the speed cap. v_ref =
 # clamp((goal - cursor) / SEEK_TAU_MS, max_speed). Smaller tau = snappier.
 SEEK_TAU_MS = 45.0
-MAX_SPEED_OSU_PMS = 4.0          # cap on the deterministic seek speed (osu!px/ms)
+MAX_SPEED_OSU_PMS = 2.5          # cap on the deterministic seek speed (osu!px/ms)
+
+# Hard kinematic acceleration cap (osu!px/ms^2). Bounds how fast the cursor
+# *velocity* may change between frames, which (a) keeps peak speed from being
+# reached instantly and (b) rounds otherwise-instant direction reversals when
+# the goal switches, so corners are swept through instead of cut sharply. This
+# is a physical limit (like MAX_SPEED), NOT a human-likeness model — style still
+# comes only from the learned residual. Convergence is preserved as long as
+# MAX_ACCEL >= MAX_SPEED / SEEK_TAU_MS (the cursor can always brake in time near
+# the goal); the default leaves a comfortable margin. Turn radius ~ v^2 / accel.
+MAX_ACCEL_OSU_PMS2 = 0.20
 
 # Learned style residual cap (osu!px/ms). The tanh output maps to
 # [-MAX_RESIDUAL, MAX_RESIDUAL]; MUST match the value baked into the dataset.
@@ -86,6 +97,24 @@ def seek_velocity(goal: Vec, cursor: Vec,
         vx *= s
         vy *= s
     return (vx, vy)
+
+
+def limit_velocity_change(v_prev: Vec, v_target: Vec, max_dv: float) -> Vec:
+    """Slew-limit a velocity toward ``v_target`` by at most ``max_dv`` (osu!px/ms).
+
+    ``max_dv = max_accel * dt_ms``. Capping the per-frame velocity *change*
+    gives the cursor inertia: it cannot reverse direction instantly when the
+    goal jumps, so sharp corners are rounded into smooth arcs, and it ramps up
+    to top speed instead of snapping there. Returns the new velocity.
+    """
+    dvx = v_target[0] - v_prev[0]
+    dvy = v_target[1] - v_prev[1]
+    mag = (dvx * dvx + dvy * dvy) ** 0.5
+    if mag > max_dv and mag > 1e-9:
+        s = max_dv / mag
+        dvx *= s
+        dvy *= s
+    return (v_prev[0] + dvx, v_prev[1] + dvy)
 
 
 def build_features(ref: Reference, cursor: Vec, prev_cursor: Vec,

@@ -278,7 +278,7 @@ def main():
     ap.add_argument("--max-residual", type=float, default=1.5,
                     help="clip |style residual| to this (osu!px/ms); MUST match "
                          "training / MotionPolicy.max_residual_osu_pms")
-    ap.add_argument("--max-speed", type=float, default=4.0,
+    ap.add_argument("--max-speed", type=float, default=2.5,
                     help="deterministic seek speed cap (osu!px/ms); MUST match "
                          "the runtime controller")
     ap.add_argument("--seek-tau", type=float, default=45.0,

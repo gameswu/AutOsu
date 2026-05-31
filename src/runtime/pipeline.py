@@ -46,8 +46,13 @@ class PipelineConfig:
     tap_hold_ms: float = 40.0
     spin_radius_osu: float = 60.0
     slide_follow_radius_osu: float = 120.0
+    # Slider/spinner occlusion buffering: keep holding through brief detection
+    # dropouts so a one-frame visual loss doesn't break a slide/spin.
+    slide_grace_ms: float = 90.0
+    spin_grace_ms: float = 120.0
     # Deterministic seek (guarantees the cursor converges to the goal).
-    max_speed_osu_pms: float = 4.0    # seek speed cap
+    max_speed_osu_pms: float = 2.5    # seek speed cap (lower = gentler)
+    max_accel_osu_pms2: float = 0.20  # kinematic cap: rounds turns, eases launches
     seek_tau_ms: float = 45.0         # seek time constant
     # Optional learned style residual (from scripts/train_motion.py). Without it
     # the cursor runs on the pure deterministic seek, which already plays
@@ -132,7 +137,10 @@ class GamePipeline:
             tap_hold_ms=self.config.tap_hold_ms,
             spin_radius_osu=self.config.spin_radius_osu,
             slide_follow_radius_osu=self.config.slide_follow_radius_osu,
+            slide_grace_ms=self.config.slide_grace_ms,
+            spin_grace_ms=self.config.spin_grace_ms,
             max_speed_osu_pms=self.config.max_speed_osu_pms,
+            max_accel_osu_pms2=self.config.max_accel_osu_pms2,
             seek_tau_ms=self.config.seek_tau_ms,
             motion_net_path=self.config.motion_net_path,
             max_residual_osu_pms=self.config.max_residual_osu_pms,
@@ -143,6 +151,7 @@ class GamePipeline:
                 else "deterministic seek (no style weights)")
         print(f"[Pipeline] Controller: navigation goal + {mode} "
               f"(max_speed={self.config.max_speed_osu_pms} osu!px/ms, "
+              f"max_accel={self.config.max_accel_osu_pms2} osu!px/ms^2, "
               f"tau={self.config.seek_tau_ms} ms)")
 
         # Screen capture

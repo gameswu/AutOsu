@@ -25,10 +25,21 @@ hit_window: 0.90              # tap once approach_ratio >= this
 tap_hold_ms: 40.0            # how long a tap key stays held
 spin_radius_osu: 60.0        # spinner sweep radius
 slide_follow_radius_osu: 120.0   # max cursor->ball follow distance on sliders
+# Occlusion buffering: keep the slider/spin key held (and hover at the last
+# known point) through brief detector dropouts, so a one- or two-frame visual
+# loss doesn't release the key and break the slide/spin. Released once the
+# object has actually been gone longer than the grace.
+slide_grace_ms: 90.0
+spin_grace_ms: 120.0
 # Deterministic seek toward the navigation goal. This alone guarantees the
 # cursor converges onto each object (cursor += seek_velocity * dt); smaller tau
-# is snappier, max_speed caps the seek velocity.
-max_speed_osu_pms: 4.0
+# is snappier, max_speed caps the seek velocity. max_accel is a hard kinematic
+# limit on how fast the velocity may change: it rounds otherwise-sharp turns
+# into arcs and eases launches instead of snapping to top speed. Keep
+# max_accel >= max_speed / seek_tau (here 2.5/45 = 0.056) to preserve
+# convergence; turn radius ~ max_speed^2 / max_accel.
+max_speed_osu_pms: 2.5
+max_accel_osu_pms2: 0.20
 seek_tau_ms: 45.0
 # Optional learned style residual from scripts/train_motion.py. Adds human-like
 # deviation on top of the seek, faded to ~0 at the tap instant. Leave unset to

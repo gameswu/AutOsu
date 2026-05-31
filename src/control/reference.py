@@ -34,7 +34,7 @@ from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
 from src.control.tracker import TimingTracker
-from src.control.planner import Scene, SceneObject, build_scene, select_target
+from src.control.planner import Scene, build_scene, select_target
 
 Vec = Tuple[float, float]
 
@@ -75,6 +75,8 @@ class ReferenceController:
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
         slide_follow_radius_osu: float = 120.0,  # match a ball within this of the slide point
+        slide_grace_ms: float = 90.0,  # keep holding a slider through brief ball dropouts
+        spin_grace_ms: float = 120.0,  # keep spinning through brief spinner dropouts
         seed: Optional[int] = None,    # unused (kept for call-site compatibility)
     ):
         self.hit_window = hit_window
@@ -83,6 +85,8 @@ class ReferenceController:
         self.spin_radius_osu = spin_radius_osu
         self.spin_speed = spin_speed
         self.slide_follow_radius_osu = slide_follow_radius_osu
+        self.slide_grace_ms = slide_grace_ms
+        self.spin_grace_ms = spin_grace_ms
 
         self.timing = TimingTracker()
 
@@ -93,7 +97,11 @@ class ReferenceController:
         self._tap_until = 0.0
         self._last_tap_t = -1e9
         self._spin_angle = 0.0
+        self._spin_center: Optional[Vec] = None  # last seen spinner centre
+        self._spin_last_seen_t = -1e9
         self._slide_pos: Optional[Vec] = None
+        self._slide_vel: Vec = (0.0, 0.0)   # smoothed ball velocity, osu!px/ms
+        self._slide_last_seen_t = -1e9   # last frame a followable ball was seen
         self._last_t: Optional[float] = None
         self._cursor: Vec = (256.0, 192.0)
 
@@ -106,7 +114,11 @@ class ReferenceController:
         self._tap_until = 0.0
         self._last_tap_t = -1e9
         self._spin_angle = 0.0
+        self._spin_center = None
+        self._spin_last_seen_t = -1e9
         self._slide_pos = None
+        self._slide_vel = (0.0, 0.0)
+        self._slide_last_seen_t = -1e9
         self._last_t = None
         if cursor is not None:
             self._cursor = cursor
@@ -138,11 +150,20 @@ class ReferenceController:
 
         # Spinner takes over whenever present.
         if scene.spinner is not None:
-            return self._do_spin(scene.spinner, dt, t_ms)
+            self._spin_center = (scene.spinner.x, scene.spinner.y)
+            self._spin_last_seen_t = t_ms
+            return self._do_spin(self._spin_center, dt, t_ms)
 
         if self._state == PHASE_SPIN:
+            # Spinner detection may have dropped for a frame. Keep spinning
+            # around the last known centre during a short grace before
+            # conceding the spin ended — a one-frame release breaks the spin.
+            if (self._spin_center is not None
+                    and (t_ms - self._spin_last_seen_t) <= self.spin_grace_ms):
+                return self._do_spin(self._spin_center, dt, t_ms)
             self._state = PHASE_APPROACH  # spinner gone — release the spin key
             self._held_key = None
+            self._spin_center = None
 
         # Follow a live slider ball whenever one is present near the slide point,
         # regardless of internal state (salvages a missed head-tap).
@@ -174,6 +195,10 @@ class ReferenceController:
                 self._held_key = key
                 self._state = PHASE_SLIDE
                 self._slide_pos = goal
+                self._slide_vel = (0.0, 0.0)
+                # Start the dropout grace clock so the head->ball gap (and any
+                # early detection misses) doesn't trigger a spurious release.
+                self._slide_last_seen_t = t_ms
             else:
                 self._tap_key = key
                 self._tap_until = t_ms + self.tap_hold_ms
@@ -181,10 +206,27 @@ class ReferenceController:
         return self._finish(goal, t_ms, phase=PHASE_APPROACH, target=goal,
                             ratio=target.approach_ratio, tth=tth)
 
+    def _slide_predict(self, t_ms: float) -> Optional[Vec]:
+        """Dead-reckon the ball's position from its last sighting + velocity.
+
+        Returns the clamped extrapolated point if we have a last-seen slide
+        position, else ``None``. Used both to re-centre the ball search after a
+        dropout (the ball has moved) and as the cursor goal during the grace.
+        """
+        if self._slide_pos is None:
+            return None
+        elapsed = max(0.0, t_ms - self._slide_last_seen_t)
+        px = self._slide_pos[0] + self._slide_vel[0] * elapsed
+        py = self._slide_pos[1] + self._slide_vel[1] * elapsed
+        return (max(0.0, min(512.0, px)), max(0.0, min(384.0, py)))
+
     def _do_slide(self, scene: Scene, t_ms: float) -> Optional[Reference]:
         # Find a followable ball within the continuity radius of the slide point.
         # The distance ceiling stops us latching onto the next slider's ball.
-        ref_pt: Vec = self._slide_pos or self._cursor
+        # While mid-slide we centre the search on the *predicted* ball location
+        # (dead-reckoned), so a ball that moved during a dropout is still caught.
+        predicted = self._slide_predict(t_ms) if self._state == PHASE_SLIDE else None
+        ref_pt: Vec = predicted or self._slide_pos or self._cursor
         ball: Optional[Vec] = None
         best_d = self.slide_follow_radius_osu
         for o in scene.objects:
@@ -200,27 +242,49 @@ class ReferenceController:
             # (missed tap, orphan ball), grab a key so the ticks still count.
             if self._held_key is None:
                 self._held_key = self._take_key()
+            # Estimate the ball's velocity (EMA-smoothed) from its motion since
+            # the last sighting, so we can dead-reckon through a brief dropout.
+            if self._slide_pos is not None:
+                dt = t_ms - self._slide_last_seen_t
+                if 1e-3 < dt <= self.slide_grace_ms + 50.0:
+                    ivx = (ball[0] - self._slide_pos[0]) / dt
+                    ivy = (ball[1] - self._slide_pos[1]) / dt
+                    a = 0.5
+                    self._slide_vel = (a * ivx + (1.0 - a) * self._slide_vel[0],
+                                       a * ivy + (1.0 - a) * self._slide_vel[1])
             self._state = PHASE_SLIDE
             self._slide_pos = ball
+            self._slide_last_seen_t = t_ms
             return self._finish(ball, t_ms, phase=PHASE_SLIDE, target=ball,
                                 ratio=1.0)
 
-        # No ball near the slide point. If the ball is genuinely gone the slider
-        # has ended — release immediately and hand off to approach (no dwell). A
-        # transient occlusion is recovered next frame when the ball reappears.
+        # No ball near the slide point. A genuinely-ended slider has no ball for
+        # good; a transient occlusion loses it for only a frame or two. Through a
+        # short grace window keep holding and *dead-reckon* — extrapolate along
+        # the ball's last known velocity (the slider path is locally smooth, so
+        # the recent direction is the best guess) rather than freezing in place.
+        # Releasing the key for even one frame breaks the slider. Once the ball
+        # has been gone past the grace, concede (release + hand off to approach,
+        # no dwell).
         if self._state == PHASE_SLIDE:
+            elapsed = t_ms - self._slide_last_seen_t
+            if self._slide_pos is not None and elapsed <= self.slide_grace_ms:
+                pred = predicted or self._slide_pos
+                return self._finish(pred, t_ms, phase=PHASE_SLIDE,
+                                    target=pred, ratio=1.0)
             self._held_key = None
             self._state = PHASE_APPROACH
             self._slide_pos = None
+            self._slide_vel = (0.0, 0.0)
         return None
 
-    def _do_spin(self, spinner: SceneObject, dt: float, t_ms: float) -> Reference:
+    def _do_spin(self, center: Vec, dt: float, t_ms: float) -> Reference:
         # Spinners only count rotations while a key is held; grab one on entry.
         if self._state != PHASE_SPIN or self._held_key is None:
             self._held_key = self._take_key()
         self._state = PHASE_SPIN
         self._spin_angle += self.spin_speed * dt
-        cx, cy = spinner.x, spinner.y
+        cx, cy = center
         target = (cx + self.spin_radius_osu * math.cos(self._spin_angle),
                   cy + self.spin_radius_osu * math.sin(self._spin_angle))
         return self._finish(target, t_ms, phase=PHASE_SPIN, target=target,
