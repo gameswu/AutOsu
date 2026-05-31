@@ -79,6 +79,7 @@ class ReferenceController:
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
         slide_lost_ms: float = 120.0,  # release slider key after ball lost this long
+        slide_follow_radius_osu: float = 120.0,  # only follow a ball within this of the slide point
         motion_profile: Optional[MotionProfile] = None,
         seed: Optional[int] = None,
     ):
@@ -89,6 +90,7 @@ class ReferenceController:
         self.spin_radius_osu = spin_radius_osu
         self.spin_speed = spin_speed
         self.slide_lost_ms = slide_lost_ms
+        self.slide_follow_radius_osu = slide_follow_radius_osu
 
         prof = motion_profile or MotionProfile()
         self.tap_lead_ms = prof.tap_lead_ms
@@ -160,11 +162,12 @@ class ReferenceController:
             self._state = PHASE_APPROACH  # spinner gone — release the spin key
             self._held_key = None
 
-        if self._state == PHASE_SLIDE:
-            out = self._do_slide(scene, t_ms)
-            if out is not None:
-                return out
-            # slide finished -> fall through to approach
+        # Follow an active slider ball whenever one is present near the slide
+        # point, regardless of internal state. This salvages a missed head-tap
+        # (head already faded, orphan ball visible) instead of ignoring it.
+        out = self._do_slide(scene, t_ms)
+        if out is not None:
+            return out
 
         return self._do_approach(scene, t_ms)
 
@@ -205,30 +208,44 @@ class ReferenceController:
                             ratio=target.approach_ratio, tth=tth)
 
     def _do_slide(self, scene: Scene, t_ms: float) -> Optional[Reference]:
-        # Find the active slider (one carrying a detected ball, else nearest).
+        # Find a followable ball within the continuity radius of the current
+        # slide point. The distance ceiling is essential: without it we would
+        # latch onto *any* visible slider ball (the next slider's, or a stray
+        # detection) and never release the slide, skipping the following taps.
+        ref_pt: Vec = self._slide_pos or self._cursor
         ball: Optional[Vec] = None
-        best_d = 1e9
+        best_d = self.slide_follow_radius_osu
         for o in scene.objects:
             if o.kind != "slider":
                 continue
             if o.has_ball and o.ball_x is not None:
-                d = _dist(self._slide_pos or (o.ball_x, o.ball_y),
-                          (o.ball_x, o.ball_y))
+                d = _dist(ref_pt, (o.ball_x, o.ball_y))
                 if d < best_d:
                     best_d, ball = d, (o.ball_x, o.ball_y)
 
         if ball is not None:
-            # Best case: follow the detected ball / follow-circle.
+            # Best case: follow the detected ball / follow-circle. If we reached
+            # the ball without a registered head-tap (missed tap, orphan ball),
+            # grab a key now so the remaining slider ticks still count.
+            if self._held_key is None:
+                self._held_key = self._take_key()
+            self._state = PHASE_SLIDE
             self._slide_last_seen = t_ms
             self._slide_pos = ball
             pos = self.motion.follow(self._cursor, ball)
             return self._finish(pos, t_ms, phase=PHASE_SLIDE, target=ball,
                                 ratio=1.0)
 
-        # No ball this frame. Do NOT jump to the slider end — that skips the
-        # path. Instead hold the current position with the key down for a short
-        # grace window, covering transient ball occlusion / missed detections.
-        # Once that grace lapses with no ball, treat the slider as ended.
+        # No ball near the slide point this frame. Only hold through the grace
+        # window if we are genuinely mid-slide; otherwise this is not a slide
+        # and approach should take over.
+        if self._state != PHASE_SLIDE:
+            return None
+
+        # Do NOT jump to the slider end — that skips the path. Hold the current
+        # position with the key down for a short grace window, covering
+        # transient ball occlusion / missed detections. Once that grace lapses
+        # with no ball, treat the slider as ended.
         if (t_ms - self._slide_last_seen) <= self.slide_lost_ms:
             hold = self._slide_pos or self._cursor
             return self._finish(hold, t_ms, phase=PHASE_SLIDE, target=hold,

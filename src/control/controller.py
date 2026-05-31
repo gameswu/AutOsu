@@ -51,6 +51,7 @@ class Controller:
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
         slide_lost_ms: float = 120.0,  # release slider key after ball lost this long
+        slide_follow_radius_osu: float = 120.0,  # only follow a ball within this of the slide point
         jitter: float = 1.2,
         motion_profile: Optional[MotionProfile] = None,
         motion_net_path: Optional[str] = None,   # learned residual weights
@@ -86,6 +87,7 @@ class Controller:
             spin_radius_osu=spin_radius_osu,
             spin_speed=spin_speed,
             slide_lost_ms=slide_lost_ms,
+            slide_follow_radius_osu=slide_follow_radius_osu,
             motion_profile=ref_profile,
             seed=seed,
         )
