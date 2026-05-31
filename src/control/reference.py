@@ -1,31 +1,29 @@
 """
-Deterministic reference generator for the CPRP controller.
+Deterministic *navigation* reference for the neural-motion controller.
 
-This is the *constraint-satisfying* layer of the Constraint-Projected Residual
-Policy (CPRP)::
+This layer no longer moves the cursor. Every frame, purely from the current
+vision scene, it emits two things:
 
-    cursor(t) = reference(t) + gate(phase) * residual(t)
+* the **navigation goal** — the point the cursor should be heading to right now
+  (the most imminent circle / slider head, the live slider ball, or the spin
+  orbit point), in osu! coordinates, and
+* the **key state** — the hard constraint (tap a circle, hold a slider / spin),
+  decided from the approach ring.
 
-``reference(t)`` is produced here, every frame, purely from the current vision
-scene. It is the same explicit geometry the old monolithic controller used —
-min-jerk reach to the most imminent circle / slider head, reactive slider-ball
-following, and circular spinner sweep — and it guarantees the hard constraints
-(pass through the hit object, stay on the ball / spin circle) on its own. A
-learned residual (:mod:`src.control.motion_net`) is layered on top by
-:class:`src.control.controller.Controller`; when no weights are present the
-reference is emitted unchanged (min-jerk fallback).
+The actual cursor motion toward that goal is produced entirely by the learned
+:mod:`src.control.motion_net` policy (mandatory). There is deliberately **no
+hand-coded motion model here** — no min-jerk, jitter, overshoot, fixed reach
+time, or fixed dwell. Human-likeness comes only from the trained net.
 
-The controller exposes two entry points:
+Two entry points:
 
 * :meth:`ReferenceController.update` — build a :class:`Scene` from raw
   detections and step (the runtime path).
 * :meth:`ReferenceController.step` — advance one frame from an already-built
-  :class:`Scene` (reused offline by ``scripts/build_motion_dataset.py`` to
-  reconstruct the reference from beatmap ground truth).
+  :class:`Scene` (reused offline by ``scripts/build_motion_dataset.py``).
 
-Each step returns a :class:`Reference` carrying the reference cursor target, the
-key state, the current phase, and the reference-relative target features the
-residual net consumes.
+Each step returns a :class:`Reference` carrying the navigation goal, key state,
+phase, and the timing features the policy consumes.
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
 from src.control.tracker import TimingTracker
-from src.control.motion import HumanMotion, MotionProfile
 from src.control.planner import Scene, SceneObject, build_scene, select_target
 
 Vec = Tuple[float, float]
@@ -45,7 +42,7 @@ Vec = Tuple[float, float]
 VK_Z = 0x5A
 VK_X = 0x58
 
-# Phase labels (also used as residual-net feature one-hot order)
+# Phase labels (also used as policy feature one-hot order)
 PHASE_IDLE = "idle"
 PHASE_APPROACH = "approach"
 PHASE_SLIDE = "slide"
@@ -54,8 +51,8 @@ PHASE_SPIN = "spin"
 
 @dataclass
 class Reference:
-    """One frame of deterministic reference output + residual-net features."""
-    x: float                     # reference cursor target, osu! coords
+    """One frame of navigation goal + key state + policy features."""
+    x: float                     # navigation goal, osu! coords (mirror of target)
     y: float
     key_z: bool = False
     key_x: bool = False
@@ -68,55 +65,40 @@ class Reference:
 
 
 class ReferenceController:
-    """Deterministic approach / slide / spin reference generator."""
+    """Vision-only navigation-goal + key-state generator."""
 
     def __init__(
         self,
         hit_window: float = 0.90,      # tap once ratio >= this
-        hit_radius_osu: float = 80.0,  # cursor must be within this of target to tap
         tap_hold_ms: float = 40.0,     # how long a tap key stays down
         tap_refractory_ms: float = 70.0,  # min gap between taps (anti double-hit)
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
-        slide_lost_ms: float = 120.0,  # release slider key after ball lost this long
-        slide_follow_radius_osu: float = 120.0,  # only follow a ball within this of the slide point
-        motion_profile: Optional[MotionProfile] = None,
-        seed: Optional[int] = None,
+        slide_follow_radius_osu: float = 120.0,  # match a ball within this of the slide point
+        seed: Optional[int] = None,    # unused (kept for call-site compatibility)
     ):
         self.hit_window = hit_window
-        self.hit_radius_osu = hit_radius_osu
         self.tap_hold_ms = tap_hold_ms
         self.tap_refractory_ms = tap_refractory_ms
         self.spin_radius_osu = spin_radius_osu
         self.spin_speed = spin_speed
-        self.slide_lost_ms = slide_lost_ms
         self.slide_follow_radius_osu = slide_follow_radius_osu
 
-        prof = motion_profile or MotionProfile()
-        self.tap_lead_ms = prof.tap_lead_ms
         self.timing = TimingTracker()
-        self.motion = HumanMotion(
-            jitter=prof.jitter,
-            follow_alpha=prof.follow_alpha,
-            overshoot=prof.overshoot,
-            seed=seed,
-        )
 
         self._state = PHASE_APPROACH    # approach | slide | spin
         self._next_key = VK_Z           # alternation
-        self._held_key: Optional[int] = None   # slider hold
+        self._held_key: Optional[int] = None   # slider / spin hold
         self._tap_key: Optional[int] = None
         self._tap_until = 0.0
         self._last_tap_t = -1e9
         self._spin_angle = 0.0
-        self._slide_last_seen = 0.0
         self._slide_pos: Optional[Vec] = None
         self._last_t: Optional[float] = None
         self._cursor: Vec = (256.0, 192.0)
 
     def reset(self, cursor: Optional[Vec] = None) -> None:
         self.timing.reset()
-        self.motion.reset()
         self._state = PHASE_APPROACH
         self._next_key = VK_Z
         self._held_key = None
@@ -162,9 +144,8 @@ class ReferenceController:
             self._state = PHASE_APPROACH  # spinner gone — release the spin key
             self._held_key = None
 
-        # Follow an active slider ball whenever one is present near the slide
-        # point, regardless of internal state. This salvages a missed head-tap
-        # (head already faded, orphan ball visible) instead of ignoring it.
+        # Follow a live slider ball whenever one is present near the slide point,
+        # regardless of internal state (salvages a missed head-tap).
         out = self._do_slide(scene, t_ms)
         if out is not None:
             return out
@@ -176,20 +157,15 @@ class ReferenceController:
     def _do_approach(self, scene: Scene, t_ms: float) -> Reference:
         target = select_target(scene)
         if target is None:
+            # Nothing to do — hold (the policy is skipped on idle).
             return self._finish(self._cursor, t_ms, phase=PHASE_IDLE)
 
         goal: Vec = (target.x, target.y)
         tth = self.timing.time_to_hit_ms(target.approach_ratio)
-        pos = self.motion.plan_point(self._cursor, goal, tth, t_ms)
 
-        # Fire when the approach ring has (nearly) collapsed OR we are within the
-        # baked human tap-lead window of the exact hit moment.
-        timed = (target.approach_ratio >= self.hit_window
-                 or (self.tap_lead_ms > 0.0 and tth <= self.tap_lead_ms))
-        ready = (timed
-                 and _dist(self._cursor, goal) <= self.hit_radius_osu
+        # Tap purely on the vision ring; the policy owns where the cursor is.
+        ready = (target.approach_ratio >= self.hit_window
                  and (t_ms - self._last_tap_t) >= self.tap_refractory_ms)
-
         if ready:
             key = self._take_key()
             self._last_tap_t = t_ms
@@ -197,21 +173,17 @@ class ReferenceController:
                 # Hold the key and begin following the slider.
                 self._held_key = key
                 self._state = PHASE_SLIDE
-                self._slide_last_seen = t_ms
                 self._slide_pos = goal
             else:
-                # Circle: brief tap.
                 self._tap_key = key
                 self._tap_until = t_ms + self.tap_hold_ms
 
-        return self._finish(pos, t_ms, phase=PHASE_APPROACH, target=goal,
+        return self._finish(goal, t_ms, phase=PHASE_APPROACH, target=goal,
                             ratio=target.approach_ratio, tth=tth)
 
     def _do_slide(self, scene: Scene, t_ms: float) -> Optional[Reference]:
-        # Find a followable ball within the continuity radius of the current
-        # slide point. The distance ceiling is essential: without it we would
-        # latch onto *any* visible slider ball (the next slider's, or a stray
-        # detection) and never release the slide, skipping the following taps.
+        # Find a followable ball within the continuity radius of the slide point.
+        # The distance ceiling stops us latching onto the next slider's ball.
         ref_pt: Vec = self._slide_pos or self._cursor
         ball: Optional[Vec] = None
         best_d = self.slide_follow_radius_osu
@@ -224,43 +196,26 @@ class ReferenceController:
                     best_d, ball = d, (o.ball_x, o.ball_y)
 
         if ball is not None:
-            # Best case: follow the detected ball / follow-circle. If we reached
-            # the ball without a registered head-tap (missed tap, orphan ball),
-            # grab a key now so the remaining slider ticks still count.
+            # Follow the ball. If we reached it without a registered head-tap
+            # (missed tap, orphan ball), grab a key so the ticks still count.
             if self._held_key is None:
                 self._held_key = self._take_key()
             self._state = PHASE_SLIDE
-            self._slide_last_seen = t_ms
             self._slide_pos = ball
-            pos = self.motion.follow(self._cursor, ball)
-            return self._finish(pos, t_ms, phase=PHASE_SLIDE, target=ball,
+            return self._finish(ball, t_ms, phase=PHASE_SLIDE, target=ball,
                                 ratio=1.0)
 
-        # No ball near the slide point this frame. Only hold through the grace
-        # window if we are genuinely mid-slide; otherwise this is not a slide
-        # and approach should take over.
-        if self._state != PHASE_SLIDE:
-            return None
-
-        # Do NOT jump to the slider end — that skips the path. Hold the current
-        # position with the key down for a short grace window, covering
-        # transient ball occlusion / missed detections. Once that grace lapses
-        # with no ball, treat the slider as ended.
-        if (t_ms - self._slide_last_seen) <= self.slide_lost_ms:
-            hold = self._slide_pos or self._cursor
-            return self._finish(hold, t_ms, phase=PHASE_SLIDE, target=hold,
-                                ratio=1.0)
-
-        # Ball lost beyond grace — the slider has ended.
-        self._held_key = None
-        self._state = PHASE_APPROACH
-        self._slide_pos = None
+        # No ball near the slide point. If the ball is genuinely gone the slider
+        # has ended — release immediately and hand off to approach (no dwell). A
+        # transient occlusion is recovered next frame when the ball reappears.
+        if self._state == PHASE_SLIDE:
+            self._held_key = None
+            self._state = PHASE_APPROACH
+            self._slide_pos = None
         return None
 
     def _do_spin(self, spinner: SceneObject, dt: float, t_ms: float) -> Reference:
-        # Spinners only count rotations while a key is held (osu! ignores cursor
-        # motion when no key is down), so grab a key on entry and hold it for
-        # the whole spin.
+        # Spinners only count rotations while a key is held; grab one on entry.
         if self._state != PHASE_SPIN or self._held_key is None:
             self._held_key = self._take_key()
         self._state = PHASE_SPIN
@@ -268,8 +223,7 @@ class ReferenceController:
         cx, cy = spinner.x, spinner.y
         target = (cx + self.spin_radius_osu * math.cos(self._spin_angle),
                   cy + self.spin_radius_osu * math.sin(self._spin_angle))
-        pos = self.motion.follow(self._cursor, target, alpha=0.6)
-        return self._finish(pos, t_ms, phase=PHASE_SPIN, target=target,
+        return self._finish(target, t_ms, phase=PHASE_SPIN, target=target,
                             ratio=1.0)
 
     # ── key bookkeeping ───────────────────────────────────────────────────
@@ -281,7 +235,7 @@ class ReferenceController:
 
     def _finish(
         self,
-        pos: Vec,
+        goal: Vec,
         t_ms: float,
         phase: str = PHASE_IDLE,
         target: Optional[Vec] = None,
@@ -295,7 +249,7 @@ class ReferenceController:
         z = (self._held_key == VK_Z) or (self._tap_key == VK_Z)
         x = (self._held_key == VK_X) or (self._tap_key == VK_X)
         tx, ty = (target if target is not None else (None, None))
-        return Reference(x=pos[0], y=pos[1], key_z=z, key_x=x, phase=phase,
+        return Reference(x=goal[0], y=goal[1], key_z=z, key_x=x, phase=phase,
                          target_x=tx, target_y=ty, approach_ratio=ratio,
                          time_to_hit_ms=tth)
 

@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-Offline motion-residual dataset builder for the CPRP controller.
+Offline motion-policy dataset builder.
 
-Reconstructs the deterministic *reference* trajectory frame-by-frame from
-beatmap ground truth (no rendering, geometry only), runs it against the real
-human cursor from the matched replay, and records the supervised target::
+Reconstructs the deterministic *navigation goal* frame-by-frame from beatmap
+ground truth (no rendering, geometry only), pairs it with the real human cursor
+from the matched replay, and records the supervised target — the **human cursor
+velocity** (osu!px per ms)::
 
-    residual(t) = human_cursor(t) - reference(t)
+    velocity(t) = (human_cursor(t + dt) - human_cursor(t)) / dt
 
-together with the reference-relative features the residual net consumes
-(:func:`src.control.motion_net.build_features`). The reference is driven with
-the human cursor as its previous position (teacher forcing), so the residual is
-exactly the human deviation the net must learn.
+together with the goal-relative features the policy consumes
+(:func:`src.control.motion_net.build_features`). Velocity (not per-frame
+displacement) is the label so the policy is resampling-rate independent.
 
 This runs **entirely offline** on matched (.osu, .osr) pairs. The runtime player
-never reads beatmaps or replays — this only distils *how* humans deviate from
-the constraint-satisfying path into training data for
-``scripts/train_motion.py``.
+never reads beatmaps or replays — this only distils *how* humans move toward the
+navigation goal into training data for ``scripts/train_motion.py``.
 
-Output is a ``.npz`` with ``features`` (N, FEATURE_DIM) and ``residual`` (N, 2,
-osu!px). Train with the **same** ``--max-residual`` the runtime
-``ResidualPolicy`` uses (default 20).
+Output is a ``.npz`` with ``features`` (N, FEATURE_DIM) and ``velocity`` (N, 2,
+osu!px/ms). Train with the **same** ``--max-speed`` the runtime ``MotionPolicy``
+uses (default 4.0 osu!px/ms).
 
 Usage::
 
@@ -176,12 +175,11 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
 # ── driver ──────────────────────────────────────────────────────────────────
 
 def build(data_dir: str, fps: int, max_replays: Optional[int],
-          max_residual: float):
+          max_speed: float):
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
     from src.control.reference import ReferenceController
-    from src.control.motion import MotionProfile
-    from src.control.motion_net import build_features, phase_gate
+    from src.control.motion_net import build_features
 
     pairs = find_replay_pairs(data_dir)
     if not pairs:
@@ -190,7 +188,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
 
     dt = 1000.0 / float(fps)
     feats_all: List[List[float]] = []
-    resid_all: List[Tuple[float, float]] = []
+    vel_all: List[Tuple[float, float]] = []
     n_replays = 0
 
     for osu_path, osr_paths in pairs:
@@ -221,9 +219,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
             lo = max(t_start, rs)
             hi = min(t_end, re)
 
-            # Clean reference (no jitter/overshoot) — the net learns deviation.
-            rc = ReferenceController(motion_profile=MotionProfile(jitter=0.0,
-                                                                  overshoot=0.0))
+            rc = ReferenceController()
             cur = track.at(lo)
             rc.reset(cursor=cur)
             prev = cur
@@ -233,13 +229,14 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
             t = lo
             while t <= hi:
                 cur = track.at(t)
+                nxt = track.at(t + dt)
                 scene, start_idx = _scene_at(objs, start_idx, t)
                 ref = rc.step(scene, cur, t)
-                if ref.phase != "idle" and phase_gate(ref) > 0.0:
-                    rx = max(-max_residual, min(max_residual, cur[0] - ref.x))
-                    ry = max(-max_residual, min(max_residual, cur[1] - ref.y))
-                    feats_all.append(build_features(ref, cur, prev))
-                    resid_all.append((rx, ry))
+                if ref.phase != "idle":
+                    vx = max(-max_speed, min(max_speed, (nxt[0] - cur[0]) / dt))
+                    vy = max(-max_speed, min(max_speed, (nxt[1] - cur[1]) / dt))
+                    feats_all.append(build_features(ref, cur, prev, dt))
+                    vel_all.append((vx, vy))
                     kept += 1
                 prev = cur
                 t += dt
@@ -254,12 +251,12 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
         print("ERROR: no samples produced", file=sys.stderr)
         sys.exit(1)
 
-    return feats_all, resid_all, n_replays
+    return feats_all, vel_all, n_replays
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a motion-residual dataset from real osu! replays.")
+        description="Build a motion-policy dataset from real osu! replays.")
     ap.add_argument("--data", "-d", default="raw_data",
                     help="raw_data dir (beatmaps/ + replays/)")
     ap.add_argument("--output", "-o", default="runs/motion/dataset.npz",
@@ -268,13 +265,13 @@ def main():
                     help="resampling rate for the reference simulation")
     ap.add_argument("--max-replays", "-n", type=int, default=None,
                     help="cap the number of replays processed")
-    ap.add_argument("--max-residual", type=float, default=20.0,
-                    help="clip |residual| to this (osu!px); MUST match training "
-                         "/ ResidualPolicy.max_residual_osu")
+    ap.add_argument("--max-speed", type=float, default=4.0,
+                    help="clip |velocity| to this (osu!px/ms); MUST match "
+                         "training / MotionPolicy.max_speed_osu_pms")
     args = ap.parse_args()
 
-    feats, resid, n_replays = build(args.data, args.fps, args.max_replays,
-                                    args.max_residual)
+    feats, vel, n_replays = build(args.data, args.fps, args.max_replays,
+                                  args.max_speed)
 
     import numpy as np
     out = Path(args.output)
@@ -282,14 +279,15 @@ def main():
     np.savez_compressed(
         out,
         features=np.asarray(feats, dtype=np.float32),
-        residual=np.asarray(resid, dtype=np.float32),
-        max_residual=np.float32(args.max_residual),
+        velocity=np.asarray(vel, dtype=np.float32),
+        max_speed=np.float32(args.max_speed),
+        fps=np.int32(args.fps),
     )
 
     print("\n── dataset ─────────────────────────────")
-    print(f"  replays    : {n_replays}")
-    print(f"  samples    : {len(feats)}")
-    print(f"  max_residual: {args.max_residual} osu!px")
+    print(f"  replays   : {n_replays}")
+    print(f"  samples   : {len(feats)}")
+    print(f"  max_speed : {args.max_speed} osu!px/ms")
     print(f"\nWrote {out}")
 
 

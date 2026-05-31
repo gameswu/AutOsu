@@ -67,13 +67,12 @@ def main():
         use_dxcam=cfg.get("use_dxcam", True),
         target_fps=cfg.get("target_fps", 120),
         hit_window=cfg.get("hit_window", 0.90),
-        hit_radius_osu=cfg.get("hit_radius_osu", 80.0),
         tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
         spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
-        motion_jitter=cfg.get("motion_jitter", 1.2),
-        motion_profile_path=cfg.get("motion_profile_path", None),
+        slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
         motion_net_path=cfg.get("motion_net_path", None),
-        max_residual_osu=cfg.get("max_residual_osu", 20.0),
+        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 4.0),
+        speed_scale=cfg.get("speed_scale", 1.0),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 

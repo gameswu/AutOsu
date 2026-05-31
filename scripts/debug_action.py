@@ -78,13 +78,15 @@ def cmd_live(args):
     from src.control import Controller
     controller = Controller(
         hit_window=ctrl_cfg.get("hit_window", 0.90),
-        hit_radius_osu=ctrl_cfg.get("hit_radius_osu", 80.0),
         tap_hold_ms=ctrl_cfg.get("tap_hold_ms", 40.0),
         tap_refractory_ms=ctrl_cfg.get("tap_refractory_ms", 70.0),
         spin_radius_osu=ctrl_cfg.get("spin_radius_osu", 60.0),
         spin_speed=ctrl_cfg.get("spin_speed", 0.025),
-        slide_lost_ms=ctrl_cfg.get("slide_lost_ms", 120.0),
-        jitter=ctrl_cfg.get("motion_jitter", 1.2),
+        slide_follow_radius_osu=ctrl_cfg.get("slide_follow_radius_osu", 120.0),
+        motion_net_path=ctrl_cfg.get("motion_net_path", None),
+        max_speed_osu_pms=ctrl_cfg.get("max_speed_osu_pms", 4.0),
+        speed_scale=ctrl_cfg.get("speed_scale", 1.0),
+        device=ctrl_cfg.get("device", "cuda:0"),
     )
     print("[Live] Controller: deterministic target-point + path follower")
 
@@ -155,7 +157,7 @@ def cmd_live(args):
                 n_ball = len(dets.slider_balls)
                 print(f"{frame_idx:5d} │ {len(dets.detections):4d} {n_ring:4d} "
                       f"{n_ball:4d} │ {cur_ox:6.0f} {cur_oy:6.0f} {dt:6.1f} │ "
-                      f"{controller._state:>8} {out.x:6.0f} {out.y:6.0f} "
+                      f"{controller.reference._state:>8} {out.x:6.0f} {out.y:6.0f} "
                       f"{'Z' if out.key_z else '·':>2} {'X' if out.key_x else '·':>2} │ "
                       f"{ar_top:6.3f}")
                 if dt > 200:

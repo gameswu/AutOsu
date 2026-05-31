@@ -2,8 +2,9 @@
 Real-time pipeline: capture -> detect -> estimate approach -> controller -> inject.
 
 Runs at ~120Hz, orchestrating all components. The action is produced by the
-vision-only CPRP :class:`Controller`: a deterministic constraint-satisfying
-reference plus an optional learned, bounded residual on the cursor.
+vision-only :class:`Controller`: a deterministic navigation goal + key state
+(the hard constraints) driven by a mandatory learned motion policy that
+produces the cursor velocity.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import numpy as np
 
 from src.vision.detector import Detection, Detector, FrameDetections, ObjClass
 from src.control import Controller, ControlOutput
-from src.control.motion import MotionProfile
 
 
 @dataclass
@@ -41,20 +41,17 @@ class PipelineConfig:
     target_fps: int = 120
     use_tensorrt: bool = False
 
-    # Controller (CPRP player) tuning
+    # Controller tuning
     hit_window: float = 0.90
-    hit_radius_osu: float = 80.0
     tap_hold_ms: float = 40.0
     spin_radius_osu: float = 60.0
-    motion_jitter: float = 1.2
-    # Optional baked human-motion profile (from scripts/analyze_motion.py).
-    # When set, overrides jitter and supplies overshoot/follow_alpha/tap_lead_ms.
-    motion_profile_path: Optional[str] = None
-    # Optional learned residual weights (from scripts/train_motion.py). When set
-    # and loadable, the CPRP residual layer shapes cursor motion on top of the
-    # deterministic reference; otherwise the reference passes through unchanged.
+    slide_follow_radius_osu: float = 120.0
+    # Learned motion policy weights (from scripts/train_motion.py). REQUIRED —
+    # the controller has no deterministic motion fallback and will fail to
+    # initialise without a loadable policy.
     motion_net_path: Optional[str] = None
-    max_residual_osu: float = 20.0
+    max_speed_osu_pms: float = 4.0    # must match the trained policy / dataset
+    speed_scale: float = 1.0
 
 
 class GamePipeline:
@@ -125,26 +122,20 @@ class GamePipeline:
         self._approach_estimator.reset()
         print(f"[Pipeline] Approach estimator: YOLO approach_circle boxes + temporal fit")
 
-        # CPRP vision-only controller (deterministic reference + learned residual)
-        profile = None
-        if self.config.motion_profile_path:
-            profile = MotionProfile.load(self.config.motion_profile_path)
-            print(f"[Pipeline] Motion profile: {self.config.motion_profile_path} "
-                  f"(jitter={profile.jitter:.2f} overshoot={profile.overshoot:.3f} "
-                  f"follow_alpha={profile.follow_alpha:.2f} tap_lead_ms={profile.tap_lead_ms:.1f})")
+        # Vision-only controller: deterministic navigation goal + learned motion
+        # policy (the policy is mandatory).
         self._controller = Controller(
             hit_window=self.config.hit_window,
-            hit_radius_osu=self.config.hit_radius_osu,
             tap_hold_ms=self.config.tap_hold_ms,
             spin_radius_osu=self.config.spin_radius_osu,
-            jitter=self.config.motion_jitter,
-            motion_profile=profile,
+            slide_follow_radius_osu=self.config.slide_follow_radius_osu,
             motion_net_path=self.config.motion_net_path,
-            max_residual_osu=self.config.max_residual_osu,
+            max_speed_osu_pms=self.config.max_speed_osu_pms,
+            speed_scale=self.config.speed_scale,
+            device=self.config.device,
         )
-        mode = ("reference + learned residual" if self._controller.motion_net_active
-                else "deterministic reference (no residual weights)")
-        print(f"[Pipeline] Controller: CPRP — {mode}")
+        print(f"[Pipeline] Controller: navigation goal + learned motion policy "
+              f"(max_speed={self.config.max_speed_osu_pms} osu!px/ms)")
 
         # Screen capture
         region = self._mapping.capture_region

@@ -1,23 +1,21 @@
 """
-CPRP controller — Constraint-Projected Residual Policy.
+Vision-only motion controller.
 
-The runtime player composes two layers::
+Two layers, composed every frame::
 
-    cursor(t) = reference(t) + gate(phase) * residual(t)
+    goal, keys      = ReferenceController(scene)        # deterministic geometry
+    cursor(t)       = cursor(t-1) + MotionPolicy.velocity(goal) * dt   # learned
 
-* :class:`~src.control.reference.ReferenceController` produces a deterministic,
-  constraint-satisfying reference (min-jerk reach + tap timing, reactive slider
-  follow, spinner sweep) and the key state, purely from vision.
-* :class:`~src.control.motion_net.ResidualPolicy` adds a small, bounded,
-  phase-gated *learned* human offset on top of the reference cursor. With no
-  trained weights it is inactive and the reference passes through unchanged.
+* :class:`~src.control.reference.ReferenceController` produces, purely from
+  vision, the navigation goal (circle / slider-head / slider-ball / spin point)
+  and the key state (the hard constraints — taps and holds).
+* :class:`~src.control.motion_net.MotionPolicy` produces the actual cursor
+  motion toward that goal. The policy is **mandatory** (trained weights are
+  required); there is no hand-coded motion fallback.
 
-Keys come straight from the reference (the residual only nudges the cursor, it
-never decides taps), so accuracy and timing are owned by the deterministic
-layer while the learned layer only shapes *how* the cursor travels.
-
-This replaces the previous monolithic deterministic controller; that logic now
-lives in :mod:`src.control.reference` as the reference layer.
+Keys come straight from the reference (the policy only moves the cursor, it
+never decides taps), so timing is owned by the deterministic layer while all
+human-like motion is owned by the learned policy.
 """
 
 from __future__ import annotations
@@ -26,9 +24,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
-from src.control.motion import MotionProfile
-from src.control.reference import ReferenceController, VK_Z, VK_X  # noqa: F401
-from src.control.motion_net import ResidualPolicy
+from src.control.reference import ReferenceController, PHASE_IDLE, VK_Z, VK_X  # noqa: F401
+from src.control.motion_net import MotionPolicy, MAX_SPEED_OSU_PMS
 
 Vec = Tuple[float, float]
 
@@ -45,61 +42,45 @@ class Controller:
     def __init__(
         self,
         hit_window: float = 0.90,      # tap once ratio >= this
-        hit_radius_osu: float = 80.0,  # cursor must be within this of target to tap
         tap_hold_ms: float = 40.0,     # how long a tap key stays down
         tap_refractory_ms: float = 70.0,  # min gap between taps (anti double-hit)
         spin_radius_osu: float = 60.0,
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
-        slide_lost_ms: float = 120.0,  # release slider key after ball lost this long
-        slide_follow_radius_osu: float = 120.0,  # only follow a ball within this of the slide point
-        jitter: float = 1.2,
-        motion_profile: Optional[MotionProfile] = None,
-        motion_net_path: Optional[str] = None,   # learned residual weights
-        max_residual_osu: float = 20.0,          # cap on the learned offset
-        residual_scale: float = 1.0,             # global residual gain
+        slide_follow_radius_osu: float = 120.0,  # match a ball within this of the slide point
+        motion_net_path: Optional[str] = None,   # REQUIRED learned policy weights
+        max_speed_osu_pms: float = MAX_SPEED_OSU_PMS,  # cap on commanded speed
+        speed_scale: float = 1.0,      # global speed gain
+        device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        prof = motion_profile or MotionProfile(jitter=jitter)
-
-        # Learned residual layer (inactive -> pure deterministic reference).
-        self.residual = ResidualPolicy(
+        # Learned motion policy (mandatory — raises if weights are missing).
+        self.policy = MotionPolicy(
             motion_net_path,
-            max_residual_osu=max_residual_osu,
-            scale=residual_scale,
+            max_speed_osu_pms=max_speed_osu_pms,
+            scale=speed_scale,
+            device=device,
         )
-
-        # When the net supplies human deviation, the reference should be a
-        # *clean* constraint-satisfying path: drop the hand-made jitter /
-        # overshoot so the two layers don't double-count style.
-        if self.residual.active:
-            ref_profile = MotionProfile(
-                jitter=0.0, overshoot=0.0,
-                follow_alpha=prof.follow_alpha, tap_lead_ms=prof.tap_lead_ms,
-            )
-        else:
-            ref_profile = prof
 
         self.reference = ReferenceController(
             hit_window=hit_window,
-            hit_radius_osu=hit_radius_osu,
             tap_hold_ms=tap_hold_ms,
             tap_refractory_ms=tap_refractory_ms,
             spin_radius_osu=spin_radius_osu,
             spin_speed=spin_speed,
-            slide_lost_ms=slide_lost_ms,
             slide_follow_radius_osu=slide_follow_radius_osu,
-            motion_profile=ref_profile,
             seed=seed,
         )
 
         self._prev_cursor: Vec = (256.0, 192.0)
+        self._last_t: Optional[float] = None
 
     @property
     def motion_net_active(self) -> bool:
-        return self.residual.active
+        return self.policy.active
 
     def reset(self, cursor: Optional[Vec] = None) -> None:
         self.reference.reset(cursor)
+        self._last_t = None
         if cursor is not None:
             self._prev_cursor = cursor
 
@@ -110,10 +91,19 @@ class Controller:
         t_ms: float,
         to_osu: Callable[[float, float], Tuple[float, float]],
     ) -> ControlOutput:
+        dt_ms = (t_ms - self._last_t) if self._last_t is not None else 16.0
+        self._last_t = t_ms
+
         ref = self.reference.update(detections, cursor, t_ms, to_osu)
-        dx, dy = self.residual.residual(ref, cursor, self._prev_cursor)
+
+        if ref.phase == PHASE_IDLE:
+            # Nothing to navigate to — hold position.
+            cmd_x, cmd_y = cursor
+        else:
+            vx, vy = self.policy.velocity(ref, cursor, self._prev_cursor, dt_ms)
+            cmd_x = cursor[0] + vx * dt_ms
+            cmd_y = cursor[1] + vy * dt_ms
+
         self._prev_cursor = cursor
-        return ControlOutput(
-            x=ref.x + dx, y=ref.y + dy,
-            key_z=ref.key_z, key_x=ref.key_x,
-        )
+        return ControlOutput(x=cmd_x, y=cmd_y,
+                             key_z=ref.key_z, key_x=ref.key_x)
