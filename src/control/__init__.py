@@ -1,15 +1,31 @@
-"""Deterministic vision-only controller package.
+"""Vision-only CPRP controller package.
 
-Replaces the behavioural-cloning action model with an explicit
-track -> plan -> move pipeline:
+Constraint-Projected Residual Policy: a deterministic, constraint-satisfying
+reference plus an optional learned, bounded, phase-gated residual::
 
-* :mod:`src.control.tracker`   — online approach-preempt / time-to-hit estimate
-* :mod:`src.control.planner`   — scene construction + target selection
-* :mod:`src.control.motion`    — human-like (min-jerk / damped) motion
-* :mod:`src.control.controller`— approach / slide / spin state machine
+    cursor(t) = reference(t) + gate(phase) * residual(t)
+
+* :mod:`src.control.tracker`    — online approach-preempt / time-to-hit estimate
+* :mod:`src.control.planner`    — scene construction + target selection
+* :mod:`src.control.motion`     — human-like (min-jerk / damped) motion + profile
+* :mod:`src.control.reference`  — deterministic approach / slide / spin reference
+* :mod:`src.control.motion_net` — learned residual policy (fallback = zero)
+* :mod:`src.control.controller` — CPRP composition (reference + residual)
 """
 
 from src.control.controller import Controller, ControlOutput
+from src.control.reference import ReferenceController, Reference
 from src.control.motion import HumanMotion, MotionProfile
+from src.control.motion_net import ResidualPolicy, build_features, FEATURE_DIM
 
-__all__ = ["Controller", "ControlOutput", "HumanMotion", "MotionProfile"]
+__all__ = [
+    "Controller",
+    "ControlOutput",
+    "ReferenceController",
+    "Reference",
+    "HumanMotion",
+    "MotionProfile",
+    "ResidualPolicy",
+    "build_features",
+    "FEATURE_DIM",
+]

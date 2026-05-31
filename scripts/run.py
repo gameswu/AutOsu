@@ -72,6 +72,8 @@ def main():
         spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
         motion_jitter=cfg.get("motion_jitter", 1.2),
         motion_profile_path=cfg.get("motion_profile_path", None),
+        motion_net_path=cfg.get("motion_net_path", None),
+        max_residual_osu=cfg.get("max_residual_osu", 20.0),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 

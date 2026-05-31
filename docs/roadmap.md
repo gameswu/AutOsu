@@ -57,11 +57,12 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] Tested: 9000 frames, 0 errors, ~200 fps on test data
 
 ### 2b — Dataset Generator (`scripts/generate_dataset.py`)
-- [x] Unified pipeline: .osu + .osr → YOLO images + labels (7 classes)
+- [x] Unified pipeline: .osu + .osr → YOLO images + labels (5 classes)
 - [x] Uses osr2mp4 renderer for pixel-perfect frame generation
 - [x] Cursor + trail rendered from replay data (so YOLO learns to ignore it)
 - [x] YOLO labels generated from osr2mp4 beatmap hit objects, incl. approach
-      circle (class 5, ring scale 4→1) and slider ball (class 6, ping-pong path)
+      circle (class 4, ring scale 4→1) and slider ball (class 2, at the
+      follow-circle during the slide phase)
 - [x] Stacked note deduplication
 - [x] Class-balanced train split (oversample rare-class frames) + histogram
 - [x] Configurable FPS, max_beatmaps (post-filter), train/val split
@@ -88,7 +89,7 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 ## Phase 3 — Vision Models [done]
 
 ### 3a — Object Detector (`src/vision/detector.py`)
-- [x] YOLOv8-nano, 7 classes, 640x384 input
+- [x] YOLOv8-nano, 5 classes, 640x384 input
 - [x] Training script (`scripts/train_detector.py`)
 - [x] ONNX export built into training pipeline
 - [ ] TensorRT FP16 export + benchmark
@@ -121,6 +122,48 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
       tap_lead_ms) extracted offline from real replays by
       `scripts/analyze_motion.py`; loaded via `motion_profile_path` (runtime
       stays vision-only — no replays/beatmaps read at play time)
+
+### 4c — Learned Motion Net (CPRP) [implemented; weights pending]
+
+A learned, human-like cursor layer that **cannot violate hard constraints**
+(must pass through hit circles / follow the ball / stay on the spin circle),
+unlike a raw behavioral-cloning policy. **Constraint-Projected Residual
+Policy (CPRP)**.
+
+```
+cursor(t) = reference(t) + gate(phase) · residual(t)
+```
+
+- **reference(t)** — `src/control/reference.py` (`ReferenceController`).
+  Recomputed every frame from the *current detections*: min-jerk interpolation
+  toward the most-imminent target (approach/tap), the detected follow-ball
+  (slide), or the circular sweep (spin). The old monolithic deterministic
+  controller logic now lives here; it guarantees the hard constraints and the
+  key/tap timing on its own.
+- **residual(t)** — `src/control/motion_net.py` (`ResidualPolicy` + a small
+  `tanh`-bounded **MLP**) over *reference-relative* features (phase one-hot,
+  time-to-hit, target vector in cursor frame, recent velocity; `FEATURE_DIM=10`,
+  shared by runtime and the dataset builder). Output is capped at
+  `max_residual_osu`; `gate(phase)` shrinks it to ~0 at the tap/contact instants
+  (scales with `1 − approach_ratio` while approaching) so accuracy is never
+  sacrificed for style. Keys come straight from the reference — the residual
+  only nudges the cursor.
+- **composition** — `src/control/controller.py` (`Controller`) keeps the same
+  public API (`update`/`reset`/`ControlOutput`). When the residual is active the
+  reference's hand-made jitter/overshoot are disabled (the net supplies human
+  deviation instead).
+- **training** — fully offline / supervised, run on your server:
+  `scripts/build_motion_dataset.py` reconstructs the reference frame-by-frame
+  from beatmap ground truth (geometry only, no rendering) under teacher forcing
+  and records `human − reference`; `scripts/train_motion.py` regresses the
+  bounded residual. No RL, no env rollouts.
+- **runtime** — vision-only; consumes only detections + phase. With **no
+  weights** the `ResidualPolicy` is inactive and the controller emits the pure
+  deterministic reference (min-jerk fallback).
+- **config** — `motion_net_path` + `max_residual_osu` (entry points
+  `autosu-build-motion-dataset`, `autosu-train-motion`).
+- [ ] (you) build dataset + train weights on the Linux server, then set
+  `motion_net_path`
 
 ---
 
@@ -164,7 +207,7 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 ### 6b — Training Pipeline [next]
 - [ ] Collect raw data: 100+ `.osz` beatmaps + `.osr` replays across 2-5 star difficulty range
 - [ ] Run `prepare_data.py` to verify matching coverage
-- [ ] Generate full dataset with cursor rendering (~30-50K images, 7 classes, balanced)
+- [ ] Generate full dataset with cursor rendering (~30-50K images, 5 classes, balanced)
 - [ ] Train detector to mAP50 > 0.9 (incl. approach_circle / slider_ball)
 - [ ] End-to-end test on easy maps (2-3 star)
 - [ ] Record and review AI gameplay for failure analysis
@@ -199,3 +242,12 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - ~~C++ pybind11 input module~~ → ctypes SendInput is sufficient at 1000Hz
 - ~~Manual .osu/.osr pairing by filename~~ → replaced by automatic MD5 hash matching
 - ~~Custom Python renderer~~ → replaced by osr2mp4-core rendering wrapper for pixel-perfect output
+- ~~7-class detection (`slider_body`, `slider_end`)~~ → collapsed to **5 classes**
+  (`hitcircle`, `slider_head`, `slider_ball`, `spinner`, `approach_circle`).
+  `slider_body` was a noisy huge AABB and `slider_end` was unused by the
+  controller. Sliders are now labeled in two phases: head+approach-circle while
+  approaching, ball at the follow-circle while sliding.
+- ~~slider_ball never emitted (labeling bug)~~ → the visibility filter dropped a
+  whole active slider once its head circle faded (`is_fadeout` read from the
+  head), so the slide phase produced no labels. Fixed by keeping mid-slide
+  sliders visible and splitting the label phase at the object's hit time.

@@ -52,7 +52,7 @@ COL_HUD = (255, 255, 255)
 COL_KEY_ON = (60, 220, 60)
 COL_KEY_OFF = (90, 90, 90)
 
-_CLS_SHORT = {0: "C", 1: "SH", 2: "SB", 3: "SE", 4: "SP", 5: "AC", 6: "BALL"}
+_CLS_SHORT = {0: "C", 1: "SH", 2: "BALL", 3: "SP", 4: "AC"}
 
 
 def main():

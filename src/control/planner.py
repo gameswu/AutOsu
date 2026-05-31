@@ -3,13 +3,13 @@ Scene construction and target selection for the deterministic controller.
 
 Turns raw :class:`FrameDetections` (model-input pixel boxes) into a compact
 list of :class:`SceneObject` in osu! coordinates, pairing slider heads with
-their ends and follow-balls, and exposes helpers to choose what the player
+their follow-balls, and exposes helpers to choose what the player
 should be doing *right now*.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from src.vision.detector import FrameDetections, ObjClass
@@ -26,8 +26,6 @@ class SceneObject:
     # follow-targets only, not tap targets.
     head_visible: bool = True
     # Slider-only extras (osu! coords)
-    end_x: Optional[float] = None
-    end_y: Optional[float] = None
     ball_x: Optional[float] = None
     ball_y: Optional[float] = None
     has_ball: bool = False
@@ -37,9 +35,6 @@ class SceneObject:
 class Scene:
     objects: List[SceneObject]
     spinner: Optional[SceneObject] = None
-    # Slider body positions (osu! coords) — used to decide whether a slider is
-    # still active while its ball is momentarily undetected.
-    slider_bodies: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def actionables(self) -> List[SceneObject]:
@@ -69,11 +64,9 @@ def build_scene(
     Args:
         detections: detections with ``approach_ratio`` already set.
         to_osu: maps a model-input (cx, cy) to osu! (x, y).
-        pair_dist_osu: max distance to associate a slider end / ball to a head.
+        pair_dist_osu: max distance to associate a slider ball to a head.
     """
-    ends = [to_osu(d.cx, d.cy) for d in detections.slider_ends]
     balls = [to_osu(d.cx, d.cy) for d in detections.slider_balls]
-    bodies = [to_osu(d.cx, d.cy) for d in detections.slider_bodies]
 
     objects: List[SceneObject] = []
 
@@ -84,9 +77,6 @@ def build_scene(
     for d in detections.slider_heads:
         ox, oy = to_osu(d.cx, d.cy)
         obj = SceneObject("slider", ox, oy, d.approach_ratio)
-        ei = _nearest(ox, oy, ends, pair_dist_osu)
-        if ei is not None:
-            obj.end_x, obj.end_y = ends[ei]
         bi = _nearest(ox, oy, balls, pair_dist_osu)
         if bi is not None:
             obj.ball_x, obj.ball_y = balls[bi]
@@ -112,7 +102,7 @@ def build_scene(
                                     head_visible=False,
                                     ball_x=bx, ball_y=by, has_ball=True))
 
-    return Scene(objects=objects, spinner=spinner, slider_bodies=bodies)
+    return Scene(objects=objects, spinner=spinner)
 
 
 def _round(v: Optional[float]) -> Optional[int]:

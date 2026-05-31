@@ -1,8 +1,9 @@
 """
 Real-time pipeline: capture -> detect -> estimate approach -> controller -> inject.
 
-Runs at ~120Hz, orchestrating all components. The action is produced by a
-deterministic, vision-only :class:`Controller` (no learned policy).
+Runs at ~120Hz, orchestrating all components. The action is produced by the
+vision-only CPRP :class:`Controller`: a deterministic constraint-satisfying
+reference plus an optional learned, bounded residual on the cursor.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ class PipelineConfig:
     target_fps: int = 120
     use_tensorrt: bool = False
 
-    # Controller (deterministic player) tuning
+    # Controller (CPRP player) tuning
     hit_window: float = 0.90
     hit_radius_osu: float = 80.0
     tap_hold_ms: float = 40.0
@@ -49,6 +50,11 @@ class PipelineConfig:
     # Optional baked human-motion profile (from scripts/analyze_motion.py).
     # When set, overrides jitter and supplies overshoot/follow_alpha/tap_lead_ms.
     motion_profile_path: Optional[str] = None
+    # Optional learned residual weights (from scripts/train_motion.py). When set
+    # and loadable, the CPRP residual layer shapes cursor motion on top of the
+    # deterministic reference; otherwise the reference passes through unchanged.
+    motion_net_path: Optional[str] = None
+    max_residual_osu: float = 20.0
 
 
 class GamePipeline:
@@ -119,7 +125,7 @@ class GamePipeline:
         self._approach_estimator.reset()
         print(f"[Pipeline] Approach estimator: YOLO approach_circle boxes + temporal fit")
 
-        # Deterministic vision-only controller (replaces the action model)
+        # CPRP vision-only controller (deterministic reference + learned residual)
         profile = None
         if self.config.motion_profile_path:
             profile = MotionProfile.load(self.config.motion_profile_path)
@@ -133,8 +139,12 @@ class GamePipeline:
             spin_radius_osu=self.config.spin_radius_osu,
             jitter=self.config.motion_jitter,
             motion_profile=profile,
+            motion_net_path=self.config.motion_net_path,
+            max_residual_osu=self.config.max_residual_osu,
         )
-        print(f"[Pipeline] Controller: deterministic approach/slide/spin state machine")
+        mode = ("reference + learned residual" if self._controller.motion_net_active
+                else "deterministic reference (no residual weights)")
+        print(f"[Pipeline] Controller: CPRP — {mode}")
 
         # Screen capture
         region = self._mapping.capture_region

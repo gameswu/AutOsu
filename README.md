@@ -8,14 +8,24 @@ beatmaps autonomously.
 
 ```
 Screen Capture   →  YOLOv8n Detect  →  Approach (ring box)  →  Controller       →  SendInput
-  (DXcam ~2ms)       (7 classes)        (ring size → ratio)    (target + path)     (1000Hz)
+  (DXcam ~2ms)       (5 classes)        (ring size → ratio)    (target + path)     (1000Hz)
 ```
 
-Detection is learned (YOLO); everything downstream is **deterministic and
-vision-only** — no behavioral cloning. Timing comes from the detected
-approach-circle box size, and cursor movement / key timing are produced by a
-hand-written controller (min-jerk motion to the most imminent object, reactive
-slider-ball following, circular spinner sweep).
+Detection is learned (YOLO); the player is **vision-only** and built as a
+**Constraint-Projected Residual Policy (CPRP)**:
+
+```
+cursor(t) = reference(t) + gate(phase) · residual(t)
+```
+
+A deterministic *reference* layer owns timing and all hard constraints — min-jerk
+motion to the most imminent object, reactive slider-ball following, circular
+spinner sweep, and the actual taps — driven purely by the detected approach-circle
+box size. An **optional learned residual** (a small bounded, phase-gated MLP
+trained offline on real replays) then shapes *how* the cursor travels for a more
+human feel, without ever moving it off the object. With no trained weights the
+controller runs as the pure deterministic reference (min-jerk fallback), so there
+is no behavioral-cloning failure mode.
 
 ## Project Structure
 
@@ -51,7 +61,9 @@ AutOsu/
 │   │   ├── tracker.py          # online timing tracker (approach-ratio → time-to-hit)
 │   │   ├── planner.py          # scene building + target selection
 │   │   ├── motion.py           # human-like min-jerk motion + smoothing
-│   │   └── controller.py       # deterministic state machine → cursor target + keys
+│   │   ├── reference.py        # deterministic reference: approach/slide/spin + taps
+│   │   ├── motion_net.py       # learned bounded residual policy (CPRP)
+│   │   └── controller.py       # CPRP: reference + gate·residual → cursor target + keys
 │   └── runtime/
 │       ├── pipeline.py         # Main loop: capture→detect→approach→controller→inject
 │       ├── capture.py          # DXcam / mss screen capture
@@ -194,11 +206,13 @@ Outputs:
 | Directory | Contents |
 |-----------|----------|
 | `dataset/images/` + `dataset/labels/` | YOLO detection images + labels (cursor rendered from replay) |
-| `dataset/data.yaml` | YOLO dataset descriptor (7 classes) |
+| `dataset/data.yaml` | YOLO dataset descriptor (5 classes) |
 
-The generator also emits the approach-circle (class 5) and slider-ball (class 6)
-labels and class-balances the train split by oversampling rare-class frames
-(`--no-balance` / `--balance-max-factor N` to tune).
+The generator emits two phases per slider — a **slider_head** (class 1) with
+its approach-circle during the approach phase, and a **slider_ball** (class 2)
+at the follow-circle during the slide phase — plus the **approach_circle**
+(class 4) for circles/heads. It class-balances the train split by oversampling
+rare-class frames (`--no-balance` / `--balance-max-factor N` to tune).
 
 ### Step 1.5 — Preview & debug rendering
 
@@ -280,6 +294,29 @@ python scripts/analyze_motion.py --data raw_data --output configs/motion_profile
 Then point the config at it (`motion_profile_path: configs/motion_profile.yaml`)
 to override `jitter` and supply `overshoot` / `follow_alpha` / `tap_lead_ms`.
 
+#### Optional — train the CPRP residual motion net
+
+For a learned (rather than hand-tuned) human feel, train the bounded residual
+layer offline on real replays. The reference is reconstructed from beatmap
+ground truth (geometry only, no rendering) and the net regresses
+`human − reference`; the runtime stays vision-only and falls back to the
+deterministic reference when no weights are present.
+
+```bash
+# 1) build the residual dataset (features + human deviation), on your server
+python scripts/build_motion_dataset.py --data raw_data \
+    --output runs/motion/dataset.npz --max-residual 20
+
+# 2) train the tanh-bounded MLP (use the SAME --max-residual)
+python scripts/train_motion.py --dataset runs/motion/dataset.npz \
+    --output runs/motion/motion_net.pt --max-residual 20
+```
+
+Then enable it in the config with `motion_net_path: runs/motion/motion_net.pt`
+(and a matching `max_residual_osu`). When active, the hand-made jitter/overshoot
+are disabled and the net shapes cursor motion via `cursor = reference +
+gate·residual`, never moving the cursor off the object.
+
 ### Step 5 — Run the AI
 
 ```bash
@@ -341,12 +378,16 @@ trtexec --onnx=runs\detect\train\weights\best.onnx ^
 
 | Component | Architecture | Parameters | Input | Output |
 |-----------|-------------|-----------|-------|--------|
-| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 7-class bounding boxes |
+| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 5-class bounding boxes |
 | Approach Estimator | Ring-box geometry (no model) | 0 | detections | approach_ratio [0, 1] |
-| Controller | Deterministic state machine | 0 | detections + ratios | cursor target + (key_z, key_x) |
+| Reference (CPRP) | Deterministic state machine | 0 | detections + ratios | reference cursor + (key_z, key_x) |
+| Residual (CPRP) | Bounded MLP (`tanh`), optional | ~5K | reference-relative features (10) | gated cursor offset (≤ max_residual_osu) |
 
-Detection classes: `hitcircle`(0), `slider_head`(1), `slider_body`(2),
-`slider_end`(3), `spinner`(4), `approach_circle`(5), `slider_ball`(6).
+Detection classes: `hitcircle`(0), `slider_head`(1), `slider_ball`(2),
+`spinner`(3), `approach_circle`(4). Sliders are labeled in two phases: a
+`slider_head` (+`approach_circle`) while approaching, then a `slider_ball` at
+the follow-circle while sliding. The old `slider_body`/`slider_end` classes were
+dropped (body = noisy huge AABB; end = unused by the controller).
 
 ## Coordinate System
 

@@ -25,11 +25,9 @@ class ObjClass(IntEnum):
     """Detection class IDs matching the training labels."""
     HITCIRCLE = 0
     SLIDER_HEAD = 1
-    SLIDER_BODY = 2
-    SLIDER_END = 3
-    SPINNER = 4
-    APPROACH_CIRCLE = 5  # expanding ring; box size encodes approach_ratio
-    SLIDER_BALL = 6      # moving follow target during an active slider
+    SLIDER_BALL = 2      # follow-circle target during an active slide
+    SPINNER = 3
+    APPROACH_CIRCLE = 4  # expanding ring; box size encodes approach_ratio
 
 
 @dataclass
@@ -81,12 +79,8 @@ class FrameDetections:
         return [d for d in self.detections if d.cls == ObjClass.SLIDER_HEAD]
 
     @property
-    def slider_bodies(self) -> List[Detection]:
-        return [d for d in self.detections if d.cls == ObjClass.SLIDER_BODY]
-
-    @property
-    def slider_ends(self) -> List[Detection]:
-        return [d for d in self.detections if d.cls == ObjClass.SLIDER_END]
+    def slider_balls(self) -> List[Detection]:
+        return [d for d in self.detections if d.cls == ObjClass.SLIDER_BALL]
 
     @property
     def spinners(self) -> List[Detection]:
@@ -95,10 +89,6 @@ class FrameDetections:
     @property
     def approach_circles(self) -> List[Detection]:
         return [d for d in self.detections if d.cls == ObjClass.APPROACH_CIRCLE]
-
-    @property
-    def slider_balls(self) -> List[Detection]:
-        return [d for d in self.detections if d.cls == ObjClass.SLIDER_BALL]
 
     @property
     def actionable_objects(self) -> List[Detection]:

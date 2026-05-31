@@ -34,18 +34,18 @@ import yaml
 
 # ── Class colours (BGR) ─────────────────────────────────────────────────
 _COLOURS = {
-    0: (0, 255, 255),   # hitcircle   — yellow
-    1: (0, 200, 0),     # slider_head — green
-    2: (200, 100, 0),   # slider_body — teal
-    3: (0, 100, 200),   # slider_end  — orange
-    4: (255, 0, 255),   # spinner     — magenta
+    0: (0, 255, 255),   # hitcircle    — yellow
+    1: (0, 200, 0),     # slider_head  — green
+    2: (200, 100, 0),   # slider_ball  — teal
+    3: (255, 0, 255),   # spinner      — magenta
+    4: (0, 100, 200),   # approach_cir — orange
 }
 _CLASS_NAMES = {
     0: "circle",
     1: "s_head",
-    2: "s_body",
-    3: "s_end",
-    4: "spinner",
+    2: "s_ball",
+    3: "spinner",
+    4: "approach",
 }
 
 

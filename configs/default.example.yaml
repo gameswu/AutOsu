@@ -20,7 +20,7 @@ use_dxcam: true   # fall back to mss if unavailable
 # ── Runtime ──────────────────────────────────────────────────────────────
 target_fps: 120
 
-# ── Controller (deterministic vision-only player) ────────────────────────
+# ── Controller (vision-only CPRP player) ─────────────────────────────────
 hit_window: 0.90        # tap once approach_ratio >= this
 hit_radius_osu: 80.0    # cursor must be within this of the target to tap
 tap_hold_ms: 40.0       # how long a tap key stays held
@@ -30,6 +30,13 @@ motion_jitter: 1.2      # peak human-like jitter amplitude (osu!px)
 # When set, overrides motion_jitter and supplies overshoot / follow_alpha /
 # tap_lead_ms learned offline from real replays. Leave unset for built-in defaults.
 # motion_profile_path: "configs/motion_profile.yaml"
+# Optional learned residual weights from scripts/train_motion.py. When set and
+# loadable, the CPRP residual layer shapes cursor motion on top of the
+# deterministic reference (cursor = reference + gate*residual). Without it the
+# controller runs as the pure deterministic reference. When active, the hand-made
+# jitter/overshoot are disabled (the net supplies human deviation instead).
+# motion_net_path: "runs/motion/motion_net.pt"
+# max_residual_osu: 20.0  # hard cap on the learned cursor offset (osu!px)
 
 # ── Data generation (used by scripts/generate_dataset.py) ────────────────
 data:
