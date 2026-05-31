@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 Vec = Tuple[float, float]
@@ -48,11 +49,13 @@ class HumanMotion:
         jitter: float = 1.2,        # osu!px peak jitter amplitude (mid-move)
         retarget_dist: float = 40.0,  # osu!px; target jump that restarts a move
         follow_alpha: float = 0.45,   # low-pass gain for reactive following
+        overshoot: float = 0.0,       # fractional overshoot past target near arrival
         seed: Optional[int] = None,
     ):
         self.jitter = jitter
         self.retarget_dist = retarget_dist
         self.follow_alpha = follow_alpha
+        self.overshoot = overshoot
         self._rng = random.Random(seed)
 
         # Active point-move state
@@ -84,9 +87,14 @@ class HumanMotion:
             p = (t_ms - self._start_t) / total
         p = max(0.0, min(1.0, p))
         e = min_jerk(p)
+        # Human-like overshoot: ease slightly past the target before arrival,
+        # converging exactly back to it at p=1 (sin term is 0 at both ends, the
+        # extra *p biases the bump toward the end of the move).
+        if self.overshoot > 0.0:
+            e = e + self.overshoot * math.sin(math.pi * p) * p
         pos = _lerp(self._start, target, e)
         # Jitter tapers to zero as we settle on the target (accuracy at the hit).
-        return self._jittered(pos, taper=(1.0 - e))
+        return self._jittered(pos, taper=(1.0 - min(1.0, e)))
 
     # ── reactive following (no fixed arrival) ─────────────────────────────
 
@@ -105,3 +113,31 @@ class HumanMotion:
         amp = self.jitter * taper
         return (pos[0] + self._rng.gauss(0.0, amp) * 0.5,
                 pos[1] + self._rng.gauss(0.0, amp) * 0.5)
+
+
+# ── motion profile (baked from osr analysis, applied at runtime) ───────────
+
+
+@dataclass
+class MotionProfile:
+    """Human-motion parameters extracted offline from real replays
+    (`scripts/analyze_motion.py`) and baked into the deterministic controller.
+    Runtime stays purely vision-driven — this only tunes *how* the cursor moves.
+    """
+    jitter: float = 1.2          # osu!px tremor amplitude
+    overshoot: float = 0.0       # fractional overshoot past target near arrival
+    follow_alpha: float = 0.45   # slider-follow low-pass gain (higher = tighter)
+    tap_lead_ms: float = 0.0     # tap this many ms before the exact hit moment
+
+    @classmethod
+    def load(cls, path) -> "MotionProfile":
+        """Load a profile from a YAML file, ignoring unknown keys."""
+        import yaml
+        from pathlib import Path
+        p = Path(path)
+        if not p.exists():
+            return cls()
+        with open(p, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        fields = {"jitter", "overshoot", "follow_alpha", "tap_lead_ms"}
+        return cls(**{k: float(v) for k, v in data.items() if k in fields})

@@ -26,7 +26,7 @@ from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
 from src.control.tracker import TimingTracker
-from src.control.motion import HumanMotion
+from src.control.motion import HumanMotion, MotionProfile
 from src.control.planner import Scene, SceneObject, build_scene, select_target
 
 Vec = Tuple[float, float]
@@ -55,6 +55,7 @@ class Controller:
         spin_speed: float = 0.025,     # rad per ms (~4 rev/s)
         slide_lost_ms: float = 120.0,  # release slider key after ball lost this long
         jitter: float = 1.2,
+        motion_profile: Optional[MotionProfile] = None,
         seed: Optional[int] = None,
     ):
         self.hit_window = hit_window
@@ -65,8 +66,17 @@ class Controller:
         self.spin_speed = spin_speed
         self.slide_lost_ms = slide_lost_ms
 
+        # Motion profile (baked offline from real replays) tunes *how* the
+        # cursor moves and *when* taps fire, without changing vision logic.
+        prof = motion_profile or MotionProfile(jitter=jitter)
+        self.tap_lead_ms = prof.tap_lead_ms
         self.timing = TimingTracker()
-        self.motion = HumanMotion(jitter=jitter, seed=seed)
+        self.motion = HumanMotion(
+            jitter=prof.jitter,
+            follow_alpha=prof.follow_alpha,
+            overshoot=prof.overshoot,
+            seed=seed,
+        )
 
         self._state = "approach"        # approach | slide | spin
         self._next_key = VK_Z           # alternation
@@ -142,7 +152,11 @@ class Controller:
         tth = self.timing.time_to_hit_ms(target.approach_ratio)
         pos = self.motion.plan_point(self._cursor, goal, tth, t_ms)
 
-        ready = (target.approach_ratio >= self.hit_window
+        # Fire when the approach ring has (nearly) collapsed OR we are within the
+        # baked human tap-lead window of the exact hit moment.
+        timed = (target.approach_ratio >= self.hit_window
+                 or (self.tap_lead_ms > 0.0 and tth <= self.tap_lead_ms))
+        ready = (timed
                  and _dist(self._cursor, goal) <= self.hit_radius_osu
                  and (t_ms - self._last_tap_t) >= self.tap_refractory_ms)
 
@@ -176,35 +190,24 @@ class Controller:
                     best_d, ball = d, (o.ball_x, o.ball_y)
 
         if ball is not None:
-            # Best case: follow the detected ball.
+            # Best case: follow the detected ball / follow-circle.
             self._slide_last_seen = t_ms
             self._slide_pos = ball
             pos = self.motion.follow(self._cursor, ball)
             return self._finish(pos, t_ms)
 
-        # No ball this frame. Fall back to the slider tail (still drives the
-        # cursor along the path and keeps the key held), then to any slider
-        # body (the slider is clearly still on screen — hold position).
-        ref = self._slide_pos or self._cursor
-        end = _nearest_point(ref, scene.slider_ends)
-        if end is not None:
-            self._slide_last_seen = t_ms
-            self._slide_pos = end
-            pos = self.motion.follow(self._cursor, end)
-            return self._finish(pos, t_ms)
-
+        # No ball this frame. Do NOT jump to the slider end — that skips the
+        # path. Instead hold the current position with the key down for as long
+        # as the slider is plausibly still active, i.e. while its body is still
+        # on screen (plus a short grace for transient ball occlusion).
         if scene.slider_bodies:
-            # Ball + end both occluded but the body is visible: the slider is
-            # still active, so keep holding the key and hold position.
             self._slide_last_seen = t_ms
             return self._finish(self._slide_pos or self._cursor, t_ms)
 
-        # Nothing slider-like this frame; allow a short grace period (transient
-        # occlusion) before concluding the slider has ended.
         if (t_ms - self._slide_last_seen) <= self.slide_lost_ms:
             return self._finish(self._slide_pos or self._cursor, t_ms)
 
-        # Slider really ended — release the held key.
+        # Body gone and ball lost beyond grace — the slider has ended.
         self._held_key = None
         self._state = "approach"
         self._slide_pos = None
@@ -243,12 +246,3 @@ class Controller:
 
 def _dist(a: Vec, b: Vec) -> float:
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
-
-
-def _nearest_point(ref: Vec, points) -> Optional[Vec]:
-    best, best_d = None, 1e18
-    for p in points:
-        d = _dist(ref, p)
-        if d < best_d:
-            best_d, best = d, p
-    return best

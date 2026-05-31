@@ -17,6 +17,7 @@ import numpy as np
 
 from src.vision.detector import Detection, Detector, FrameDetections, ObjClass
 from src.control import Controller, ControlOutput
+from src.control.motion import MotionProfile
 
 
 @dataclass
@@ -45,11 +46,14 @@ class PipelineConfig:
     tap_hold_ms: float = 40.0
     spin_radius_osu: float = 60.0
     motion_jitter: float = 1.2
+    # Optional baked human-motion profile (from scripts/analyze_motion.py).
+    # When set, overrides jitter and supplies overshoot/follow_alpha/tap_lead_ms.
+    motion_profile_path: Optional[str] = None
 
 
 class GamePipeline:
     """
-    Main pipeline: capture → detect → build state → action model → inject.
+    Main pipeline: capture → detect → estimate approach → controller → inject.
     """
 
     def __init__(self, config: PipelineConfig):
@@ -116,12 +120,19 @@ class GamePipeline:
         print(f"[Pipeline] Approach estimator: YOLO approach_circle boxes + temporal fit")
 
         # Deterministic vision-only controller (replaces the action model)
+        profile = None
+        if self.config.motion_profile_path:
+            profile = MotionProfile.load(self.config.motion_profile_path)
+            print(f"[Pipeline] Motion profile: {self.config.motion_profile_path} "
+                  f"(jitter={profile.jitter:.2f} overshoot={profile.overshoot:.3f} "
+                  f"follow_alpha={profile.follow_alpha:.2f} tap_lead_ms={profile.tap_lead_ms:.1f})")
         self._controller = Controller(
             hit_window=self.config.hit_window,
             hit_radius_osu=self.config.hit_radius_osu,
             tap_hold_ms=self.config.tap_hold_ms,
             spin_radius_osu=self.config.spin_radius_osu,
             jitter=self.config.motion_jitter,
+            motion_profile=profile,
         )
         print(f"[Pipeline] Controller: deterministic approach/slide/spin state machine")
 

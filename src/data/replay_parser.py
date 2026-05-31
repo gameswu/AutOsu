@@ -1,9 +1,10 @@
 """
 Replay parser and frame-level data extractor.
 
-Parses .osr replay files (via osrparse) and aligns cursor/key data
-with beatmap timestamps to produce per-frame (state, action) pairs
-for behavioral cloning.
+Parses .osr replay files (via osrparse) and aligns cursor/key data with
+beatmap timestamps to produce absolute-time cursor/key frames. Used offline by
+dataset generation (cursor rendering) and by `scripts/analyze_motion.py`
+(human-motion statistics). Not used at runtime — the live player is vision-only.
 
 Data organisation::
 
@@ -75,54 +76,6 @@ class ParsedReplay:
     def frames_in_range(self, start_ms: int, end_ms: int) -> List[ReplayFrame]:
         """Get frames within a time range (inclusive)."""
         return [f for f in self.frames if start_ms <= f.time_ms <= end_ms]
-
-    def cursor_at(self, time_ms: int) -> Tuple[float, float]:
-        """Get interpolated cursor position at a given time."""
-        if not self.frames:
-            return (256.0, 192.0)
-
-        # Binary search for the closest frame
-        lo, hi = 0, len(self.frames) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if self.frames[mid].time_ms < time_ms:
-                lo = mid + 1
-            else:
-                hi = mid
-
-        # Interpolate between adjacent frames
-        idx = lo
-        if idx == 0:
-            return (self.frames[0].x, self.frames[0].y)
-        if idx >= len(self.frames):
-            return (self.frames[-1].x, self.frames[-1].y)
-
-        prev = self.frames[idx - 1]
-        curr = self.frames[idx]
-        dt = curr.time_ms - prev.time_ms
-        if dt <= 0:
-            return (curr.x, curr.y)
-
-        t = (time_ms - prev.time_ms) / dt
-        x = prev.x + (curr.x - prev.x) * t
-        y = prev.y + (curr.y - prev.y) * t
-        return (x, y)
-
-    def keys_at(self, time_ms: int) -> Tuple[bool, bool]:
-        """Get key states at a given time (nearest frame)."""
-        if not self.frames:
-            return (False, False)
-
-        lo, hi = 0, len(self.frames) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if self.frames[mid].time_ms < time_ms:
-                lo = mid + 1
-            else:
-                hi = mid
-
-        f = self.frames[min(lo, len(self.frames) - 1)]
-        return (f.key_z, f.key_x)
 
 
 def parse_replay(osr_path: str | Path) -> ParsedReplay:

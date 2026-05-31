@@ -26,6 +26,10 @@ hit_radius_osu: 80.0    # cursor must be within this of the target to tap
 tap_hold_ms: 40.0       # how long a tap key stays held
 spin_radius_osu: 60.0   # spinner sweep radius
 motion_jitter: 1.2      # peak human-like jitter amplitude (osu!px)
+# Optional baked human-motion profile from scripts/analyze_motion.py.
+# When set, overrides motion_jitter and supplies overshoot / follow_alpha /
+# tap_lead_ms learned offline from real replays. Leave unset for built-in defaults.
+# motion_profile_path: "configs/motion_profile.yaml"
 
 # ── Data generation (used by scripts/generate_dataset.py) ────────────────
 data:

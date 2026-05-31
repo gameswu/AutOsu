@@ -239,13 +239,18 @@ def _obj_kind(obj):
         return "circle"
 
 
+# Slider follow circle is ~2x the hitcircle radius; class-6 is labelled at this
+# larger footprint (centred on the ball) so it is a robust detection target.
+_FOLLOW_CIRCLE_SCALE = 2.0
+
+
 def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
     """Generate YOLO label lines from visible osr2mp4 hit objects.
 
     Classes emitted:
         0 hitcircle, 1 slider_head, 2 slider_body, 3 slider_end, 4 spinner,
         5 approach_circle (only while approaching, t_ms < obj time),
-        6 slider_ball (only while the slider is actively being followed).
+        6 slider_ball (the follow-circle region while the slider is active).
     """
     lines = []
     half_disc_w = (radius_osu * 2 * tf.playfieldscale) / w
@@ -296,12 +301,18 @@ def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
             ecy_n = ery / h
             lines.append(f"3 {ecx_n:.6f} {ecy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
 
-            # Slider ball (moving follow point during active slide)
+            # Slider ball — labelled at the ball centre but with the larger
+            # *follow circle* footprint. The bare ball is tiny and rare, so the
+            # detector struggles; the follow circle (rendered around the ball,
+            # ~2x the disc) is a far more stable, salient tracking target. We
+            # keep the box centred on the ball so the tracking point stays exact.
             ball = _slider_ball_pos(obj, t_ms)
             if ball is not None:
                 brx, bry = tf.osu_to_render(ball[0], ball[1])
+                fw = half_disc_w * _FOLLOW_CIRCLE_SCALE
+                fh = half_disc_h * _FOLLOW_CIRCLE_SCALE
                 lines.append(
-                    f"6 {brx / w:.6f} {bry / h:.6f} {half_disc_w:.6f} {half_disc_h:.6f}"
+                    f"6 {brx / w:.6f} {bry / h:.6f} {fw:.6f} {fh:.6f}"
                 )
 
         elif kind == "spinner":

@@ -266,6 +266,20 @@ cursor target and key state. Inspect it live (capture only, no input injected):
 python scripts/debug_action.py live
 ```
 
+#### Optional — bake a human motion profile
+
+The controller's *feel* (cursor tremor, overshoot, slider-follow tightness, and
+how early taps fire) can be tuned from real replays. This is a purely **offline**
+analysis — the runtime player never reads beatmaps or replays; it only loads the
+resulting numbers.
+
+```bash
+python scripts/analyze_motion.py --data raw_data --output configs/motion_profile.yaml
+```
+
+Then point the config at it (`motion_profile_path: configs/motion_profile.yaml`)
+to override `jitter` and supply `overshoot` / `follow_alpha` / `tap_lead_ms`.
+
 ### Step 5 — Run the AI
 
 ```bash

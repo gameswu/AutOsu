@@ -117,6 +117,10 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] State machine: approach/tap → slide (reactive ball follow) → spin sweep,
       Z/X alternation (`controller.py`)
 - [x] Zero learned parameters; replaced the behavioral-cloning GRU
+- [x] Optional baked `MotionProfile` (jitter / overshoot / follow_alpha /
+      tap_lead_ms) extracted offline from real replays by
+      `scripts/analyze_motion.py`; loaded via `motion_profile_path` (runtime
+      stays vision-only — no replays/beatmaps read at play time)
 
 ---
 

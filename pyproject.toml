@@ -1,7 +1,7 @@
 [project]
 name = "autOsu"
 version = "0.2.0"
-description = "Vision-based osu! std AI player — YOLO + approach estimator + GRU action model"
+description = "Vision-based osu! std AI player — YOLO detection + approach estimator + deterministic controller"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -23,6 +23,7 @@ capture = ["dxcam>=0.0.5", "mss>=9.0"]
 autosu-run = "scripts.run:main"
 autosu-generate = "scripts.generate_dataset:main"
 autosu-train-detect = "scripts.train_detector:main"
+autosu-analyze-motion = "scripts.analyze_motion:main"
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu121" }

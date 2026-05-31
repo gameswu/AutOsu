@@ -21,6 +21,10 @@ class SceneObject:
     x: float                        # osu! coords
     y: float
     approach_ratio: float = 0.0
+    # True if this object's head/disc is visible this frame (so it is a valid
+    # thing to *approach and tap*). Ball-only sliders (head already faded) are
+    # follow-targets only, not tap targets.
+    head_visible: bool = True
     # Slider-only extras (osu! coords)
     end_x: Optional[float] = None
     end_y: Optional[float] = None
@@ -33,14 +37,15 @@ class SceneObject:
 class Scene:
     objects: List[SceneObject]
     spinner: Optional[SceneObject] = None
-    # Raw slider-part positions (osu! coords), used as follow fallbacks while
-    # sliding when the ball detection drops out.
-    slider_ends: List[Tuple[float, float]] = field(default_factory=list)
+    # Slider body positions (osu! coords) — used to decide whether a slider is
+    # still active while its ball is momentarily undetected.
     slider_bodies: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def actionables(self) -> List[SceneObject]:
-        return [o for o in self.objects if o.kind in ("circle", "slider")]
+        # Only head-visible circles/sliders can be approached & tapped.
+        return [o for o in self.objects
+                if o.kind in ("circle", "slider") and o.head_visible]
 
 
 def _nearest(px: float, py: float, candidates: List[Tuple[float, float]],
@@ -96,17 +101,18 @@ def build_scene(
 
     # If a slider is mid-flight, its follow-ball may be detected without a head
     # (head already hit / faded). Surface those as standalone slider objects so
-    # the controller can keep following.
+    # the controller can keep following — but mark head_visible=False so they
+    # are never chosen as a new tap target nor fed to the timing tracker.
     used_balls = {(_round(o.ball_x), _round(o.ball_y))
                   for o in objects if o.has_ball}
     for (bx, by) in balls:
         if (_round(bx), _round(by)) in used_balls:
             continue
         objects.append(SceneObject("slider", bx, by, 1.0,
+                                    head_visible=False,
                                     ball_x=bx, ball_y=by, has_ball=True))
 
-    return Scene(objects=objects, spinner=spinner,
-                 slider_ends=ends, slider_bodies=bodies)
+    return Scene(objects=objects, spinner=spinner, slider_bodies=bodies)
 
 
 def _round(v: Optional[float]) -> Optional[int]:

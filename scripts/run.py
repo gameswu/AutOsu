@@ -3,7 +3,7 @@
 AutOsu runtime — run the AI player on a live osu! window.
 
 Modes:
-    play    — full control (capture → detect → action → inject)
+    play    — full control (capture → detect → approach → controller → inject)
     observe — detection only, no input injection (for debugging/overlay)
 
 Usage::
@@ -71,6 +71,7 @@ def main():
         tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
         spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
         motion_jitter=cfg.get("motion_jitter", 1.2),
+        motion_profile_path=cfg.get("motion_profile_path", None),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 

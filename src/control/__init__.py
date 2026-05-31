@@ -10,5 +10,6 @@ track -> plan -> move pipeline:
 """
 
 from src.control.controller import Controller, ControlOutput
+from src.control.motion import HumanMotion, MotionProfile
 
-__all__ = ["Controller", "ControlOutput"]
+__all__ = ["Controller", "ControlOutput", "HumanMotion", "MotionProfile"]
