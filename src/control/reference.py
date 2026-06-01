@@ -1,12 +1,12 @@
 """Navigation-goal + key-state generator (vision-only).
 
 Emits per frame:
-  - target list  (all visible targets the trajectory model should consider)
+  - target list  (all visible targets the scripted controller should consider)
   - key state    (tap / hold / release)
   - phase        (idle / approach / slide / spin)
 
-Cursor motion is handled entirely by the learned TrajectoryModel.  This module
-only determines *which keys to press* and *what targets exist*.
+Cursor motion is handled by the scripted Controller.  This module only
+determines *which keys to press* and *what targets exist*.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ PHASE_SPIN = "spin"
 
 @dataclass
 class TargetInfo:
-    """One target visible to the trajectory model."""
+    """One target visible to the scripted controller."""
     x: float
     y: float
     approach_ratio: float
@@ -43,7 +43,7 @@ class TargetInfo:
 
 @dataclass
 class Reference:
-    """One frame of key state + target list for the trajectory model."""
+    """One frame of key state + target list for the scripted controller."""
     key_z: bool = False
     key_x: bool = False
     phase: str = PHASE_IDLE
@@ -72,7 +72,7 @@ class ReferenceController:
     """Vision-only key-state + target-list generator.
 
     Phase FSM determines when to tap / hold / release keys.
-    Target list is passed through to the trajectory model unchanged.
+    Target list is passed through to the scripted controller unchanged.
     """
 
     def __init__(

@@ -63,7 +63,10 @@ def main():
         tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
         slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
         spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
-        motion_net_path=cfg.get("motion_net_path", None),
+        path_noise=cfg.get("path_noise", 0.18),
+        noise_smooth=cfg.get("noise_smooth", 0.90),
+        spin_radius=cfg.get("spin_radius", 60.0),
+        spin_speed=cfg.get("spin_speed", 0.025),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 

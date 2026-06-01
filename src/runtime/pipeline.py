@@ -33,15 +33,18 @@ class PipelineConfig:
     target_fps: int = 120
     use_tensorrt: bool = False
 
-    # Controller (key-press timing — rule-based, kept)
+    # Controller (key-press timing — rule-based)
     hit_window: float = 0.90
     tap_hold_ms: float = 40.0
     tap_refractory_ms: float = 70.0
     slide_grace_ms: float = 90.0
     spin_grace_ms: float = 120.0
 
-    # Trajectory model (learned cursor motion)
-    motion_net_path: Optional[str] = None
+    # Scripted cursor motion
+    path_noise: float = 0.18
+    noise_smooth: float = 0.90
+    spin_radius: float = 60.0
+    spin_speed: float = 0.025
 
 
 class GamePipeline:
@@ -98,11 +101,12 @@ class GamePipeline:
             tap_refractory_ms=self.config.tap_refractory_ms,
             slide_grace_ms=self.config.slide_grace_ms,
             spin_grace_ms=self.config.spin_grace_ms,
-            motion_net_path=self.config.motion_net_path,
-            device=self.config.device,
+            path_noise=self.config.path_noise,
+            noise_smooth=self.config.noise_smooth,
+            spin_radius=self.config.spin_radius,
+            spin_speed=self.config.spin_speed,
         )
-        mode = "learned" if self._controller.motion_net_active else "inactive"
-        print(f"[Pipeline] Controller: trajectory model {mode}")
+        print("[Pipeline] Controller: scripted motion")
 
         region = self._mapping.capture_region
         self._capture = ScreenCapture(

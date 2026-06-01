@@ -66,9 +66,6 @@ def main():
                    help="Which matched (beatmap, replay) pair to use")
     p.add_argument("--skin", "-s", required=True, help="osu! skin directory")
     p.add_argument("--detector", default="runs/detect/train/weights/best.pt")
-    p.add_argument("--motion-net", default=None,
-                   help="learned trajectory model weights (.pt); omit to hold "
-                        "cursor in place (model inactive)")
     p.add_argument("--output", "-o", default="demo.mp4")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--width", type=int, default=640)
@@ -139,8 +136,10 @@ def main():
         tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
         slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
         spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
-        motion_net_path=args.motion_net or cfg.get("motion_net_path"),
-        device=device,
+        path_noise=cfg.get("path_noise", 0.18),
+        noise_smooth=cfg.get("noise_smooth", 0.90),
+        spin_radius=cfg.get("spin_radius", 60.0),
+        spin_speed=cfg.get("spin_speed", 0.025),
     )
 
     # ── Video writer ──────────────────────────────────────────────────────

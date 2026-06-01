@@ -75,7 +75,7 @@ def cmd_live(args):
     approach_estimator = BoxApproachEstimator()
     print("[Live] Approach estimator: YOLO box (approach_circle class)")
 
-    # Deterministic controller
+    # Scripted controller
     from src.control import Controller
     controller = Controller(
         hit_window=cfg.get("hit_window", 0.90),
@@ -83,8 +83,10 @@ def cmd_live(args):
         tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
         slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
         spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
-        motion_net_path=cfg.get("motion_net_path", None),
-        device=device,
+        path_noise=cfg.get("path_noise", 0.18),
+        noise_smooth=cfg.get("noise_smooth", 0.90),
+        spin_radius=cfg.get("spin_radius", 60.0),
+        spin_speed=cfg.get("spin_speed", 0.025),
     )
 
     # Cursor reader
