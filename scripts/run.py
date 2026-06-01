@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""
-AutOsu runtime — run the AI player on a live osu! window.
-
-Modes:
-    play    — full control (capture → detect → approach → controller → inject)
-    observe — detection only, no input injection (for debugging/overlay)
+"""AutOsu runtime.
 
 Usage::
 
-    python scripts/run.py play
-    python scripts/run.py observe
-    python scripts/run.py play --config configs/default.yaml
+    python scripts/run.py play -c myconfig.yaml
+    python scripts/run.py observe -c myconfig.yaml
 """
 
 from __future__ import annotations
@@ -21,7 +15,6 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure project root is on sys.path so `from src.xxx` works
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -29,32 +22,33 @@ if _PROJECT_ROOT not in sys.path:
 import yaml
 
 
+def _load_config(path: Optional[str]) -> dict:
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        print(f"[AutOsu] config not found: {p}")
+        sys.exit(1)
+    with open(p, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+from typing import Optional
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="AutOsu — vision-based osu! AI player",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("mode", choices=["play", "observe"], default="observe", nargs="?",
-                        help="Run mode: 'play' (inject inputs) or 'observe' (display only)")
-    parser.add_argument("--config", "-c", default="configs/default.yaml",
-                        help="Path to config YAML (default: configs/default.yaml)")
-    parser.add_argument("--device", default=None,
-                        help="Override CUDA device (e.g. 'cuda:0' or 'cpu')")
-    parser.add_argument("--no-tensorrt", action="store_true",
-                        help="Disable TensorRT even if available")
+    parser = argparse.ArgumentParser(description="AutOsu — vision-based osu! AI player")
+    parser.add_argument("mode", choices=["play", "observe"], default="observe", nargs="?")
+    parser.add_argument("--config", "-c", default=None,
+                        help="Path to config YAML (no default; uses built-in defaults if omitted)")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--no-tensorrt", action="store_true")
     args = parser.parse_args()
 
-    # Load config
-    config_path = Path(args.config)
-    if config_path.exists():
-        with open(config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        print(f"[AutOsu] Config: {config_path}")
-    else:
-        cfg = {}
-        print(f"[AutOsu] No config file found, using defaults")
+    cfg = _load_config(args.config)
+    if args.config:
+        print(f"[AutOsu] Config: {args.config}")
 
-    # Build PipelineConfig
     from src.runtime.pipeline import PipelineConfig, GamePipeline
 
     pipeline_cfg = PipelineConfig(
@@ -72,41 +66,37 @@ def main():
         slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
         slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
         spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
-        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 2.5),
+        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 3.0),
         max_accel_osu_pms2=cfg.get("max_accel_osu_pms2", 0.20),
         seek_tau_ms=cfg.get("seek_tau_ms", 45.0),
+        aim_cut_fraction=cfg.get("aim_cut_fraction", 0.65),
+        lookahead_n=cfg.get("lookahead_n", 3),
         motion_net_path=cfg.get("motion_net_path", None),
         max_residual_osu_pms=cfg.get("max_residual_osu_pms", 1.5),
         style_scale=cfg.get("style_scale", 1.0),
         use_tensorrt=False if args.no_tensorrt else cfg.get("use_tensorrt", False),
     )
 
-    # Setup injector based on mode
     if args.mode == "play":
         from src.runtime.injector import InputInjector
         injector = InputInjector(polling_rate_hz=1000)
         injector.start()
-        print("[AutOsu] Mode: PLAY (input injection active)")
+        print("[AutOsu] Mode: PLAY")
     else:
         from src.runtime.injector import MockInjector
         injector = MockInjector()
-        print("[AutOsu] Mode: OBSERVE (no input injection)")
+        print("[AutOsu] Mode: OBSERVE")
 
-    # Initialize pipeline
     pipeline = GamePipeline(pipeline_cfg)
     try:
         pipeline.initialize(injector=injector)
     except FileNotFoundError as e:
         print(f"\n[ERROR] {e}")
-        print("Make sure you have trained the detector first:")
-        print("  python scripts/train_detector.py")
         sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR] Initialization failed: {e}")
-        print("Make sure osu! is running and visible on screen.")
+        print(f"\n[ERROR] Init failed: {e}")
         sys.exit(1)
 
-    # Graceful shutdown
     def signal_handler(sig, frame):
         print("\n[AutOsu] Shutting down...")
         pipeline.stop()
@@ -116,17 +106,13 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Start
     pipeline.start()
-    print(f"[AutOsu] Running at target {pipeline_cfg.target_fps} FPS")
-    print("[AutOsu] Press Ctrl+C to stop\n")
+    print(f"[AutOsu] Running @ {pipeline_cfg.target_fps} FPS  (Ctrl+C to stop)\n")
 
-    # Main loop (display stats)
     try:
         while True:
             time.sleep(1.0)
-            fps = pipeline.fps
-            print(f"\r  FPS: {fps:.0f}    ", end="", flush=True)
+            print(f"\r  FPS: {pipeline.fps:.0f}    ", end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:

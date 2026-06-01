@@ -1,57 +1,43 @@
-# AutOsu default configuration
-# Copy this file and modify for your setup.
+# AutOsu configuration example
+# Pass with: python scripts/run.py play -c config.yaml
 
-# ── Model paths ──────────────────────────────────────────────────────────
 detector_path: "runs/detect/train/weights/best.pt"
-
-# ── Device ───────────────────────────────────────────────────────────────
 device: "cuda:0"
 use_tensorrt: false
 
-# ── Detection ────────────────────────────────────────────────────────────
 conf_threshold: 0.3
 iou_threshold: 0.45
 model_input_w: 640
 model_input_h: 384
+use_dxcam: true
 
-# ── Capture ──────────────────────────────────────────────────────────────
-use_dxcam: true   # fall back to mss if unavailable
-
-# ── Runtime ──────────────────────────────────────────────────────────────
 target_fps: 120
 
-# ── Controller (vision-only player) ──────────────────────────────────────
-hit_window: 0.90              # tap once approach_ratio >= this
-tap_hold_ms: 40.0            # how long a tap key stays held
-spin_radius_osu: 60.0        # spinner sweep radius
-slide_follow_radius_osu: 120.0   # max cursor->ball follow distance on sliders
-# Occlusion buffering: keep the slider/spin key held (and hover at the last
-# known point) through brief detector dropouts, so a one- or two-frame visual
-# loss doesn't release the key and break the slide/spin. Released once the
-# object has actually been gone longer than the grace.
+# Controller
+hit_window: 0.90
+tap_hold_ms: 40.0
+spin_radius_osu: 60.0
+slide_follow_radius_osu: 120.0
 slide_grace_ms: 90.0
 spin_grace_ms: 120.0
-# Deterministic seek toward the navigation goal. This alone guarantees the
-# cursor converges onto each object (cursor += seek_velocity * dt); smaller tau
-# is snappier, max_speed caps the seek velocity. max_accel is a hard kinematic
-# limit on how fast the velocity may change: it rounds otherwise-sharp turns
-# into arcs and eases launches instead of snapping to top speed. Keep
-# max_accel >= max_speed / seek_tau (here 2.5/45 = 0.056) to preserve
-# convergence; turn radius ~ max_speed^2 / max_accel.
-max_speed_osu_pms: 2.5
+max_speed_osu_pms: 3.0
 max_accel_osu_pms2: 0.20
 seek_tau_ms: 45.0
-# Optional learned style residual from scripts/train_motion.py. Adds human-like
-# deviation on top of the seek, faded to ~0 at the tap instant. Leave unset to
-# run on the pure (accurate) seek. max_residual_osu_pms must match the trained
-# net / dataset.
+
+# Aim-point offset: fraction of hit-circle radius to shift toward next target.
+# Higher = more aggressive corner-cutting. Hit radius is auto-estimated from
+# detection boxes.
+aim_cut_fraction: 0.65
+lookahead_n: 3
+
+# Style residual (optional, leave unset for pure seek)
 # motion_net_path: "runs/motion/motion_net.pt"
 max_residual_osu_pms: 1.5
 style_scale: 1.0
 
-# ── Data generation (used by scripts/generate_dataset.py) ────────────────
+# Data generation
 data:
-  raw_data_dir: "raw_data"   # contains beatmaps/ and replays/ subdirectories
+  raw_data_dir: "raw_data"
   skin_dir: "path/to/osu/skin"
   output_dir: "dataset"
   render_width: 640
@@ -61,10 +47,8 @@ data:
   train_ratio: 0.85
   seed: 42
 
-# ── osu! API credentials (used by scripts/collect_data.py) ──────────────
-# Register at: https://osu.ppy.sh/home/account/edit -> "New OAuth Application"
-# IMPORTANT: Set callback URL to http://localhost:7272/callback
+# osu! API (for scripts/collect_data.py)
 osu_api:
-  client_id: ~       # integer, e.g. 12345
-  client_secret: ~   # string, e.g. "abcdef123456"
-  osu_session: ~         # string, paste from F12 -> Application -> Cookies
+  client_id: ~
+  client_secret: ~
+  osu_session: ~

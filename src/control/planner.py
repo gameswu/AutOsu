@@ -1,11 +1,4 @@
-"""
-Scene construction and target selection for the deterministic controller.
-
-Turns raw :class:`FrameDetections` (model-input pixel boxes) into a compact
-list of :class:`SceneObject` in osu! coordinates, pairing slider heads with
-their follow-balls, and exposes helpers to choose what the player
-should be doing *right now*.
-"""
+"""Scene construction and target selection."""
 
 from __future__ import annotations
 
@@ -17,18 +10,16 @@ from src.vision.detector import FrameDetections, ObjClass
 
 @dataclass
 class SceneObject:
-    kind: str                       # "circle" | "slider" | "spinner"
-    x: float                        # osu! coords
+    kind: str               # "circle" | "slider" | "spinner"
+    x: float                # osu! coords
     y: float
     approach_ratio: float = 0.0
-    # True if this object's head/disc is visible this frame (so it is a valid
-    # thing to *approach and tap*). Ball-only sliders (head already faded) are
-    # follow-targets only, not tap targets.
     head_visible: bool = True
-    # Slider-only extras (osu! coords)
     ball_x: Optional[float] = None
     ball_y: Optional[float] = None
     has_ball: bool = False
+    # Half-extent of the detection box in osu! coords (used to estimate CS).
+    box_radius_osu: float = 0.0
 
 
 @dataclass
@@ -38,7 +29,6 @@ class Scene:
 
     @property
     def actionables(self) -> List[SceneObject]:
-        # Only head-visible circles/sliders can be approached & tapped.
         return [o for o in self.objects
                 if o.kind in ("circle", "slider") and o.head_visible]
 
@@ -58,25 +48,28 @@ def build_scene(
     to_osu: Callable[[float, float], Tuple[float, float]],
     pair_dist_osu: float = 320.0,
 ) -> Scene:
-    """
-    Build a :class:`Scene` in osu! coordinates.
-
-    Args:
-        detections: detections with ``approach_ratio`` already set.
-        to_osu: maps a model-input (cx, cy) to osu! (x, y).
-        pair_dist_osu: max distance to associate a slider ball to a head.
-    """
+    """Build a Scene in osu! coordinates from raw detections."""
     balls = [to_osu(d.cx, d.cy) for d in detections.slider_balls]
+
+    # Scale factor: model-input px -> osu! px (approximate, uniform).
+    # to_osu maps (0,0)->(ox0,oy0) and (model_w, model_h)->(ox1,oy1).
+    # We only need the ratio for converting box half-extents.
+    _ox0, _ = to_osu(0.0, 0.0)
+    _ox1, _ = to_osu(1.0, 0.0)
+    px_to_osu = abs(_ox1 - _ox0)  # osu!px per model-input px
 
     objects: List[SceneObject] = []
 
     for d in detections.hitcircles:
         ox, oy = to_osu(d.cx, d.cy)
-        objects.append(SceneObject("circle", ox, oy, d.approach_ratio))
+        br = max(d.w, d.h) / 2.0 * px_to_osu
+        objects.append(SceneObject("circle", ox, oy, d.approach_ratio,
+                                   box_radius_osu=br))
 
     for d in detections.slider_heads:
         ox, oy = to_osu(d.cx, d.cy)
-        obj = SceneObject("slider", ox, oy, d.approach_ratio)
+        br = max(d.w, d.h) / 2.0 * px_to_osu
+        obj = SceneObject("slider", ox, oy, d.approach_ratio, box_radius_osu=br)
         bi = _nearest(ox, oy, balls, pair_dist_osu)
         if bi is not None:
             obj.ball_x, obj.ball_y = balls[bi]
@@ -89,18 +82,15 @@ def build_scene(
         ox, oy = to_osu(d.cx, d.cy)
         spinner = SceneObject("spinner", ox, oy, d.approach_ratio)
 
-    # If a slider is mid-flight, its follow-ball may be detected without a head
-    # (head already hit / faded). Surface those as standalone slider objects so
-    # the controller can keep following — but mark head_visible=False so they
-    # are never chosen as a new tap target nor fed to the timing tracker.
+    # Orphan balls (head already faded): follow-only, never a tap target.
     used_balls = {(_round(o.ball_x), _round(o.ball_y))
                   for o in objects if o.has_ball}
-    for (bx, by) in balls:
+    for bx, by in balls:
         if (_round(bx), _round(by)) in used_balls:
             continue
         objects.append(SceneObject("slider", bx, by, 1.0,
-                                    head_visible=False,
-                                    ball_x=bx, ball_y=by, has_ball=True))
+                                   head_visible=False,
+                                   ball_x=bx, ball_y=by, has_ball=True))
 
     return Scene(objects=objects, spinner=spinner)
 
@@ -110,13 +100,28 @@ def _round(v: Optional[float]) -> Optional[int]:
 
 
 def select_target(scene: Scene) -> Optional[SceneObject]:
-    """
-    Pick the single object to act on this frame.
-
-    Priority: the most imminent actionable (highest approach ratio). Spinners
-    are handled separately by the controller, so they are not returned here.
-    """
+    """Pick the most imminent actionable (highest approach_ratio)."""
     actionables = scene.actionables
     if not actionables:
         return None
     return max(actionables, key=lambda o: o.approach_ratio)
+
+
+def select_targets(scene: Scene, n: int = 3) -> List[SceneObject]:
+    """Return up to *n* actionables sorted by approach_ratio descending."""
+    return sorted(scene.actionables,
+                  key=lambda o: o.approach_ratio, reverse=True)[:n]
+
+
+def estimate_hit_radius(targets: List[SceneObject],
+                        fallback: float = 36.0) -> float:
+    """Estimate the hit-circle radius (osu!px) from detection box sizes.
+
+    Uses the median box_radius_osu of visible actionables.  Falls back to
+    *fallback* (CS4 ≈ 36 osu!px) when no boxes are available.
+    """
+    radii = [t.box_radius_osu for t in targets if t.box_radius_osu > 1e-3]
+    if not radii:
+        return fallback
+    radii.sort()
+    return radii[len(radii) // 2]

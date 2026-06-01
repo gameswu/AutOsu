@@ -14,7 +14,7 @@ Press Q or Esc to quit.
 Usage::
 
     python scripts/debug_overlay.py
-    python scripts/debug_overlay.py --config configs/default.yaml
+    python scripts/debug_overlay.py -c config.yaml
 """
 
 from __future__ import annotations
@@ -51,13 +51,17 @@ _CLASS_NAMES = {
 
 def main():
     parser = argparse.ArgumentParser(description="AutOsu debug overlay")
-    parser.add_argument("--config", "-c", default="configs/default.yaml")
+    parser.add_argument("--config", "-c", default=None,
+                        help="Path to config YAML")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    cfg_path = Path(args.config)
     cfg = {}
-    if cfg_path.exists():
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"config not found: {cfg_path}")
+            sys.exit(1)
         with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 

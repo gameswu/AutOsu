@@ -1,32 +1,13 @@
-"""
-Motion layer — deterministic goal-seeking velocity + learned style residual.
+"""Motion layer — deterministic seek + optional learned style residual.
 
-The deterministic :class:`~src.control.reference.ReferenceController` no longer
-*moves* the cursor. It only produces, every frame and purely from vision, the
-**navigation goal** (the circle / slider-head / slider-ball / spin-orbit point)
-and the **key state** (the hard constraints). The cursor motion is composed
-here, in *velocity* space (so it is resampling-rate independent)::
+Composition::
 
-    v_ref(t)   = seek_velocity(goal, cursor)              # guarantees convergence
-    v_style(t) = MotionPolicy.residual(features(t))       # learned, bounded
-    v(t)       = accel_limit(v(t-1), v_ref + gate*v_style) # kinematic smoothing
-    cursor(t)  = cursor(t-1) + v(t) * dt
+    v_ref   = seek_velocity(goal, cursor)
+    v_style = MotionPolicy.residual(features)     (learned, bounded, optional)
+    v       = accel_limit(v_prev, v_ref + gate * v_style)
+    cursor += v * dt
 
-* **v_ref** — a simple proportional seek toward the goal, capped at a max speed.
-  It always points at the goal and shrinks as the cursor arrives, so the cursor
-  is *mathematically guaranteed* to converge (no covariate-shift drift). This is
-  reactive/self-correcting, not a pre-baked trajectory.
-* **v_style** — a small ``tanh``-bounded MLP that adds human-like deviation
-  (curved approach, micro-tremor, hesitation) on top of the seek. It is
-  **optional**: with no trained weights the cursor runs on the pure seek, which
-  already plays accurately. ``gate = 1 - approach_ratio`` fades the style to ~0
-  at the tap instant and during slider/spinner contact (ratio = 1), so accuracy
-  is never sacrificed for style.
-
-The features are goal-relative (phase one-hot, time-to-hit, the goal vector in
-the cursor frame, recent velocity). Train offline with
-``scripts/build_motion_dataset.py`` + ``scripts/train_motion.py``; ``torch`` is
-imported lazily so this module imports fine on machines without it.
+torch is imported lazily.
 """
 
 from __future__ import annotations
@@ -42,51 +23,30 @@ from src.control.reference import (
 
 Vec = Tuple[float, float]
 
-# Feature layout (keep in sync with build_features / the training dataset):
-#   [0:3] phase one-hot   (approach, slide, spin)   -> idle = all zero
-#   [3]   approach_ratio  (0 outside approach)
-#   [4]   time_to_hit normalised  (clamp tth / TTH_NORM_MS)
-#   [5:7] goal vector in cursor frame (/ POS_NORM)
-#   [7]   distance to goal (/ POS_NORM)
-#   [8:10] recent velocity, osu!px/ms (/ VEL_NORM_PMS)
+# Feature layout (keep in sync with build_features / dataset):
+#   [0:3]  phase one-hot  (approach, slide, spin)
+#   [3]    approach_ratio
+#   [4]    tth normalised
+#   [5:7]  goal vector / POS_NORM
+#   [7]    distance / POS_NORM
+#   [8:10] velocity / VEL_NORM
 FEATURE_DIM = 10
 
-_POS_NORM = 256.0        # osu!px half-playfield, normalises offsets to ~[-1, 1]
-_VEL_NORM_PMS = 1.5      # osu!px/ms, a brisk human flick
-_TTH_NORM_MS = 500.0     # ms; approach features saturate past half a second
+_POS_NORM = 256.0
+_VEL_NORM_PMS = 1.5
+_TTH_NORM_MS = 500.0
 
-# Deterministic seek: proportional time constant and the speed cap. v_ref =
-# clamp((goal - cursor) / SEEK_TAU_MS, max_speed). Smaller tau = snappier.
 SEEK_TAU_MS = 45.0
-MAX_SPEED_OSU_PMS = 2.5          # cap on the deterministic seek speed (osu!px/ms)
-
-# Hard kinematic acceleration cap (osu!px/ms^2). Bounds how fast the cursor
-# *velocity* may change between frames, which (a) keeps peak speed from being
-# reached instantly and (b) rounds otherwise-instant direction reversals when
-# the goal switches, so corners are swept through instead of cut sharply. This
-# is a physical limit (like MAX_SPEED), NOT a human-likeness model — style still
-# comes only from the learned residual. Convergence is preserved as long as
-# MAX_ACCEL >= MAX_SPEED / SEEK_TAU_MS (the cursor can always brake in time near
-# the goal); the default leaves a comfortable margin. Turn radius ~ v^2 / accel.
+MAX_SPEED_OSU_PMS = 3.0
 MAX_ACCEL_OSU_PMS2 = 0.20
-
-# Learned style residual cap (osu!px/ms). The tanh output maps to
-# [-MAX_RESIDUAL, MAX_RESIDUAL]; MUST match the value baked into the dataset.
 MAX_RESIDUAL_OSU_PMS = 1.5
-
-# Hidden width of the policy MLP.
 HIDDEN_DIM = 64
 
 
 def seek_velocity(goal: Vec, cursor: Vec,
                   max_speed: float = MAX_SPEED_OSU_PMS,
                   tau_ms: float = SEEK_TAU_MS) -> Vec:
-    """Deterministic proportional seek toward ``goal`` (osu!px/ms).
-
-    Always points at the goal and decays as the cursor arrives, so integrating
-    ``cursor += seek_velocity(...) * dt`` is guaranteed to converge (critically
-    damped, no overshoot). The magnitude is capped at ``max_speed``.
-    """
+    """Proportional seek toward *goal* (osu!px/ms), capped at *max_speed*."""
     dx = goal[0] - cursor[0]
     dy = goal[1] - cursor[1]
     tau = tau_ms if tau_ms > 1e-3 else SEEK_TAU_MS
@@ -100,13 +60,7 @@ def seek_velocity(goal: Vec, cursor: Vec,
 
 
 def limit_velocity_change(v_prev: Vec, v_target: Vec, max_dv: float) -> Vec:
-    """Slew-limit a velocity toward ``v_target`` by at most ``max_dv`` (osu!px/ms).
-
-    ``max_dv = max_accel * dt_ms``. Capping the per-frame velocity *change*
-    gives the cursor inertia: it cannot reverse direction instantly when the
-    goal jumps, so sharp corners are rounded into smooth arcs, and it ramps up
-    to top speed instead of snapping there. Returns the new velocity.
-    """
+    """Slew-limit velocity change to *max_dv* (= max_accel * dt)."""
     dvx = v_target[0] - v_prev[0]
     dvy = v_target[1] - v_prev[1]
     mag = (dvx * dvx + dvy * dvy) ** 0.5
@@ -119,12 +73,7 @@ def limit_velocity_change(v_prev: Vec, v_target: Vec, max_dv: float) -> Vec:
 
 def build_features(ref: Reference, cursor: Vec, prev_cursor: Vec,
                    dt_ms: float) -> List[float]:
-    """Goal-relative feature vector (length :data:`FEATURE_DIM`).
-
-    Identical at runtime and during offline dataset construction so the policy
-    sees exactly what it was trained on. ``dt_ms`` is the time since the
-    previous frame, used to express velocity in osu!px/ms (FPS-independent).
-    """
+    """Goal-relative feature vector (length FEATURE_DIM)."""
     approach = 1.0 if ref.phase == PHASE_APPROACH else 0.0
     slide = 1.0 if ref.phase == PHASE_SLIDE else 0.0
     spin = 1.0 if ref.phase == PHASE_SPIN else 0.0
@@ -147,13 +96,8 @@ def build_features(ref: Reference, cursor: Vec, prev_cursor: Vec,
 
 
 def make_motion_net(in_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM):
-    """Build the policy MLP (lazy ``torch`` import).
-
-    Two hidden layers, ``tanh`` output in [-1, 1] (scaled to osu!px/ms by the
-    caller). Returns an ``nn.Module``.
-    """
+    """Build the policy MLP (lazy torch import). tanh output in [-1, 1]."""
     import torch.nn as nn
-
     return nn.Sequential(
         nn.Linear(in_dim, hidden),
         nn.ReLU(),
@@ -165,29 +109,19 @@ def make_motion_net(in_dim: int = FEATURE_DIM, hidden: int = HIDDEN_DIM):
 
 
 class MotionPolicyError(RuntimeError):
-    """Raised when a *provided* motion-policy weights path cannot be loaded."""
+    """Weights path given but cannot be loaded."""
 
 
 class MotionPolicy:
-    """Optional learned style residual on top of the deterministic seek.
+    """Optional learned style residual.
 
-    Loads a trained MLP and predicts a bounded cursor-velocity *residual*
-    (osu!px/ms) that the controller adds — gated — to the deterministic
-    :func:`seek_velocity`. The policy is **optional**:
-
-    * ``path`` is ``None`` / empty  -> inactive (no error); the controller runs
-      on the pure deterministic seek, which already converges accurately.
-    * ``path`` is given but missing / unreadable, or ``torch`` is unavailable
-      -> :class:`MotionPolicyError` (a real misconfiguration, surfaced loudly).
+    path=None/empty -> inactive (pure seek).
+    path given but bad -> MotionPolicyError.
     """
 
-    def __init__(
-        self,
-        path: Optional[str],
-        max_residual_osu_pms: float = MAX_RESIDUAL_OSU_PMS,
-        scale: float = 1.0,
-        device: str = "cpu",
-    ):
+    def __init__(self, path: Optional[str],
+                 max_residual_osu_pms: float = MAX_RESIDUAL_OSU_PMS,
+                 scale: float = 1.0, device: str = "cpu"):
         self.max_residual = float(max_residual_osu_pms)
         self.scale = float(scale)
         self.device = device
@@ -202,15 +136,13 @@ class MotionPolicy:
     def load(self, path: Optional[str]) -> None:
         from pathlib import Path
         if not path:
-            # Optional: no weights -> pure deterministic seek.
             self._net = None
             self._torch = None
-            print("[MotionPolicy] no weights -> deterministic seek only "
-                  "(no learned style)")
+            print("[MotionPolicy] no weights -> deterministic seek only")
             return
         p = Path(path)
         if not p.exists():
-            raise MotionPolicyError(f"motion policy weights not found at {p}")
+            raise MotionPolicyError(f"weights not found: {p}")
         try:
             import torch
             net = make_motion_net()
@@ -222,17 +154,14 @@ class MotionPolicy:
             net.to(self.device)
             self._torch = torch
             self._net = net
-            print(f"[MotionPolicy] loaded style residual: {p} "
-                  f"(max_residual={self.max_residual} osu!px/ms)")
+            print(f"[MotionPolicy] loaded: {p}")
         except MotionPolicyError:
             raise
-        except Exception as e:  # torch missing / bad checkpoint
-            raise MotionPolicyError(
-                f"failed to load motion policy {p}: {e}") from e
+        except Exception as e:
+            raise MotionPolicyError(f"failed to load {p}: {e}") from e
 
     def residual(self, ref: Reference, cursor: Vec, prev_cursor: Vec,
                  dt_ms: float) -> Vec:
-        """Bounded style-residual velocity (osu!px/ms). (0, 0) if inactive."""
         if self._net is None:
             return (0.0, 0.0)
         feats = build_features(ref, cursor, prev_cursor, dt_ms)

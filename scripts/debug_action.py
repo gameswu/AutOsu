@@ -33,18 +33,19 @@ import yaml
 # ── live mode ───────────────────────────────────────────────────────────
 
 def cmd_live(args):
-    """Capture live, run the deterministic controller, print diagnostics
-    (no input injected)."""
-    cfg_path = Path(args.config)
+    """Capture live, run controller, print diagnostics (no injection)."""
     cfg = {}
-    if cfg_path.exists():
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"[Live] config not found: {cfg_path}")
+            sys.exit(1)
         with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
     device = args.device or cfg.get("device", "cuda:0")
     model_w = cfg.get("model_input_w", 640)
     model_h = cfg.get("model_input_h", 384)
-    ctrl_cfg = cfg.get("controller", {}) or {}
 
     # Window
     from src.runtime.window import get_playfield_mapping
@@ -77,24 +78,24 @@ def cmd_live(args):
     # Deterministic controller
     from src.control import Controller
     controller = Controller(
-        hit_window=ctrl_cfg.get("hit_window", 0.90),
-        tap_hold_ms=ctrl_cfg.get("tap_hold_ms", 40.0),
-        tap_refractory_ms=ctrl_cfg.get("tap_refractory_ms", 70.0),
-        spin_radius_osu=ctrl_cfg.get("spin_radius_osu", 60.0),
-        spin_speed=ctrl_cfg.get("spin_speed", 0.025),
-        slide_follow_radius_osu=ctrl_cfg.get("slide_follow_radius_osu", 120.0),
-        slide_grace_ms=ctrl_cfg.get("slide_grace_ms", 90.0),
-        spin_grace_ms=ctrl_cfg.get("spin_grace_ms", 120.0),
-        max_speed_osu_pms=ctrl_cfg.get("max_speed_osu_pms", 2.5),
-        max_accel_osu_pms2=ctrl_cfg.get("max_accel_osu_pms2", 0.20),
-        seek_tau_ms=ctrl_cfg.get("seek_tau_ms", 45.0),
-        motion_net_path=ctrl_cfg.get("motion_net_path", None),
-        max_residual_osu_pms=ctrl_cfg.get("max_residual_osu_pms", 1.5),
-        style_scale=ctrl_cfg.get("style_scale", 1.0),
-        device=ctrl_cfg.get("device", "cuda:0"),
+        hit_window=cfg.get("hit_window", 0.90),
+        tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
+        tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
+        spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
+        spin_speed=cfg.get("spin_speed", 0.025),
+        slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
+        slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
+        spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
+        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 3.0),
+        max_accel_osu_pms2=cfg.get("max_accel_osu_pms2", 0.20),
+        seek_tau_ms=cfg.get("seek_tau_ms", 45.0),
+        aim_cut_fraction=cfg.get("aim_cut_fraction", 0.65),
+        lookahead_n=cfg.get("lookahead_n", 3),
+        motion_net_path=cfg.get("motion_net_path", None),
+        max_residual_osu_pms=cfg.get("max_residual_osu_pms", 1.5),
+        style_scale=cfg.get("style_scale", 1.0),
+        device=device,
     )
-    print("[Live] Controller: navigation goal + deterministic seek "
-          "(+ optional learned style)")
 
     # Cursor reader
     try:
@@ -320,7 +321,8 @@ def main():
     sub = parser.add_subparsers(dest="cmd")
 
     p_live = sub.add_parser("live", help="Live capture + controller diagnostics (no injection)")
-    p_live.add_argument("--config", "-c", default="configs/default.yaml")
+    p_live.add_argument("--config", "-c", default=None,
+                        help="Path to config YAML")
     p_live.add_argument("--device", default=None)
 
     p_geo = sub.add_parser("approach-geo",

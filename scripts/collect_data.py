@@ -22,7 +22,7 @@ Prerequisites:
      - Press F12 -> Application -> Cookies -> osu.ppy.sh
      - Copy the value of the ``osu_session`` cookie
 
-  3. Put credentials in configs/default.yaml::
+   3. Put credentials in your config YAML (pass with -c)::
 
        osu_api:
          client_id: 12345
@@ -527,12 +527,12 @@ How to get osu_session cookie:
   1. Open https://osu.ppy.sh in browser, log in
   2. F12 -> Application -> Cookies -> osu.ppy.sh
   3. Copy the value of "osu_session"
-  4. Paste into configs/default.yaml under osu_api.osu_session
+  4. Paste into your config YAML under osu_api.osu_session
         """,
     )
     parser.add_argument(
-        "--config", "-c", default="configs/default.yaml",
-        help="Path to config YAML (default: configs/default.yaml)",
+        "--config", "-c", default=None,
+        help="Path to config YAML (for osu_api credentials and data paths)",
     )
     parser.add_argument(
         "--data", "-d", default=None,
@@ -568,9 +568,12 @@ How to get osu_session cookie:
     args = parser.parse_args()
 
     # ── Load config ───────────────────────────────────────────────
-    config_path = Path(args.config)
     config: Dict[str, Any] = {}
-    if config_path.exists():
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            print(f"ERROR: config not found: {config_path}")
+            sys.exit(1)
         with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
 
@@ -591,11 +594,13 @@ How to get osu_session cookie:
     if not client_id or not client_secret:
         print("ERROR: osu! API credentials not configured.")
         print()
-        print("Add to configs/default.yaml:")
+        print("Add to your config YAML:")
         print("  osu_api:")
         print("    client_id: 12345")
         print('    client_secret: "your_secret"')
         print('    osu_session: "eyJpdiI6..."')
+        print()
+        print("Then pass: --config path/to/config.yaml")
         print()
         print("Or pass via CLI:")
         print("  --client-id 12345 --client-secret xxx --session eyJ...")
@@ -610,7 +615,7 @@ How to get osu_session cookie:
         print("  1. Open https://osu.ppy.sh in browser, log in")
         print("  2. F12 -> Application -> Cookies -> osu.ppy.sh")
         print('  3. Copy the value of "osu_session"')
-        print("  4. Paste into configs/default.yaml:")
+        print("  4. Add to your config YAML:")
         print('       osu_session: "eyJpdiI6..."')
         print("  Or pass via CLI:")
         print("       --session eyJpdiI6...")
@@ -652,7 +657,7 @@ How to get osu_session cookie:
         print("    2. Cookie expired — get a fresh one from F12")
         print("    3. Cookie was URL-encoded — paste the raw value")
         print()
-        print('  In configs/default.yaml, make sure it looks like:')
+        print('  In your config YAML, make sure it looks like:')
         print('    osu_session: "eyJpdiI6...In0="')
         print()
         print("  Or pass directly via CLI:")
