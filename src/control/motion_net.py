@@ -142,13 +142,20 @@ def make_trajectory_model(
             else:
                 target_embeds = self.target_encoder(target_features)
                 query = cursor_embed.unsqueeze(1)
-                key_padding_mask = ~target_mask
+                # Unmask first key for no-target rows to prevent
+                # softmax(all -inf) = NaN in MHA.
+                no_tgt = ~has_targets
+                if no_tgt.any():
+                    safe_mask = target_mask.clone()
+                    safe_mask[no_tgt, 0] = True
+                    key_padding_mask = ~safe_mask
+                else:
+                    key_padding_mask = ~target_mask
                 attn_out, _ = self.cross_attn(
                     query, target_embeds, target_embeds,
                     key_padding_mask=key_padding_mask,
                 )
                 attn_out = attn_out.squeeze(1)
-                no_tgt = ~has_targets
                 if no_tgt.any():
                     attn_out[no_tgt] = self.idle_embed
 
@@ -258,3 +265,23 @@ def arrival_safeguard(v: Vec, cursor: Vec, target: Vec, tth_ms: float) -> Vec:
         return v
     correction = needed - v_toward
     return (v[0] + correction * nx, v[1] + correction * ny)
+
+
+def spin_tangential(v: Vec, cursor: Vec, center: Vec) -> Vec:
+    """Project velocity onto the tangent of the circle about *center*.
+
+    Drops the radial component, keeping only the tangential (rotational) part.
+    The model's learned angular speed is preserved; radial drift — the spiral
+    collapse/blow-up that pure-model inference accumulates during a spinner — is
+    removed.  The orbit radius stays fixed at whatever it was on spin entry.
+
+    Zero parameters: pure geometry from the observed cursor/center.
+    """
+    rx = cursor[0] - center[0]
+    ry = cursor[1] - center[1]
+    r = (rx * rx + ry * ry) ** 0.5
+    if r < 1e-3:
+        return v          # at the centre: no defined tangent, let model act
+    nx, ny = rx / r, ry / r
+    v_radial = v[0] * nx + v[1] * ny
+    return (v[0] - v_radial * nx, v[1] - v_radial * ny)

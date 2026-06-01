@@ -92,6 +92,25 @@ def main():
         device = "cpu"
 
     n = len(cursor_feats)
+
+    # Sanity: detect NaN / Inf in loaded data.
+    for name, arr in [("cursor_features", cursor_feats),
+                      ("target_features", target_feats),
+                      ("velocities", velocities)]:
+        bad = ~np.isfinite(arr)
+        if bad.any():
+            n_bad = int(bad.any(axis=tuple(range(1, arr.ndim))).sum())
+            print(f"WARNING: {name} has {bad.sum()} non-finite values "
+                  f"in {n_bad} samples — replacing with 0")
+            arr[bad] = 0.0
+
+    # Check target mask: samples where no target is valid.
+    no_target = ~target_masks.any(axis=-1)
+    n_no_tgt = int(no_target.sum())
+    if n_no_tgt > 0:
+        print(f"[train] {n_no_tgt}/{n} samples have empty target masks "
+              f"({100*n_no_tgt/n:.1f}%) — model uses idle_embed for these")
+
     vel_rms = float(np.sqrt(np.mean(velocities ** 2)))
     print(f"[train] device={device}  samples={n}  vel_rms={vel_rms:.4f} osu!px/ms")
 
@@ -135,6 +154,7 @@ def main():
             pred = net(cb, tb, mb)
             loss = loss_fn(pred, vb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
             opt.step()
             tr_loss += loss.item() * len(cb)
         tr_loss /= max(1, len(tr_idx))

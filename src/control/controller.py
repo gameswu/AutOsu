@@ -14,10 +14,15 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
-from src.control.reference import ReferenceController, PHASE_IDLE, PHASE_APPROACH, VK_Z, VK_X  # noqa: F401
+from src.control.reference import (
+    ReferenceController,
+    PHASE_IDLE, PHASE_APPROACH, PHASE_SLIDE, PHASE_SPIN,
+    VK_Z, VK_X,  # noqa: F401
+)
 from src.control.motion_net import (
     TrajectoryPolicy,
     arrival_safeguard,
+    spin_tangential,
 )
 
 Vec = Tuple[float, float]
@@ -86,8 +91,10 @@ class Controller:
             cursor, self._vel, ref.phase, ref.targets, tth_fn,
         )
 
-        # Arrival safeguard: approach phase only, on the most urgent target.
-        if ref.phase == PHASE_APPROACH and ref.targets:
+        # Zero-parameter geometric constraints (the irreducible physics; the
+        # model still supplies all motion style).
+        if ref.phase == PHASE_APPROACH:
+            # Radial arrival onto the most urgent non-active target.
             approach_targets = [t for t in ref.targets if not t.is_active]
             if approach_targets:
                 primary = max(approach_targets, key=lambda t: t.approach_ratio)
@@ -95,6 +102,19 @@ class Controller:
                 vx, vy = arrival_safeguard(
                     (vx, vy), cursor, (primary.x, primary.y), tth,
                 )
+        elif ref.phase == PHASE_SLIDE:
+            # Track the slider ball: reach it within one frame (tth = dt).
+            ball = next((t for t in ref.targets
+                         if t.is_active and t.kind == "slider"), None)
+            if ball is not None:
+                vx, vy = arrival_safeguard(
+                    (vx, vy), cursor, (ball.x, ball.y), dt_ms,
+                )
+        elif ref.phase == PHASE_SPIN:
+            # Keep only the tangential (rotational) component about the centre.
+            center = next((t for t in ref.targets if t.kind == "spinner"), None)
+            if center is not None:
+                vx, vy = spin_tangential((vx, vy), cursor, (center.x, center.y))
 
         self._vel = (vx, vy)
         cmd_x = cursor[0] + vx * dt_ms
