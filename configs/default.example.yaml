@@ -37,6 +37,15 @@ lookahead_n: 3
 max_residual_osu_pms: 1.5
 style_scale: 1.0
 
+# Motion training (scripts/train_motion.py -c config.yaml)
+motion_training:
+  dataset: "runs/motion/dataset.npz"
+  output: "runs/motion/motion_net.pt"
+  epochs: 60
+  batch_size: 4096
+  lr: 0.001
+  val_frac: 0.1
+
 # Data generation
 data:
   raw_data_dir: "raw_data"

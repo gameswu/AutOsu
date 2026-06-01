@@ -38,6 +38,8 @@ if _PROJECT_ROOT not in sys.path:
 
 def main():
     ap = argparse.ArgumentParser(description="Train the motion-policy style residual.")
+    ap.add_argument("--config", "-c", default=None,
+                    help="Path to config YAML (reads max_residual_osu_pms, device)")
     ap.add_argument("--dataset", "-d", default="runs/motion/dataset.npz",
                     help="dataset .npz from build_motion_dataset.py")
     ap.add_argument("--output", "-o", default="runs/motion/motion_net.pt",
@@ -47,54 +49,80 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--max-residual", type=float, default=None,
-                    help="override; defaults to the value stored in the dataset")
-    ap.add_argument("--device", default="cuda")
+                    help="override; defaults to config or dataset value")
+    ap.add_argument("--device", default=None)
     args = ap.parse_args()
+
+    import yaml
+    cfg: dict = {}
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"ERROR: config not found: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    mt = cfg.get("motion_training", {}) or {}
+
+    # CLI > config section > built-in defaults.
+    dataset_path = args.dataset if args.dataset != "runs/motion/dataset.npz" else mt.get("dataset", "runs/motion/dataset.npz")
+    output_path = args.output if args.output != "runs/motion/motion_net.pt" else mt.get("output", "runs/motion/motion_net.pt")
+    epochs = args.epochs if args.epochs != 60 else mt.get("epochs", 60)
+    batch_size = args.batch_size if args.batch_size != 4096 else mt.get("batch_size", 4096)
+    lr = args.lr if args.lr != 1e-3 else mt.get("lr", 1e-3)
+    val_frac = args.val_frac if args.val_frac != 0.1 else mt.get("val_frac", 0.1)
 
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, TensorDataset
     from src.control.motion_net import make_motion_net, FEATURE_DIM
 
-    data = np.load(args.dataset)
+    data = np.load(dataset_path)
     feats = data["features"].astype("float32")
     resid = data["residual"].astype("float32")
     if feats.shape[1] != FEATURE_DIM:
         print(f"ERROR: dataset feature dim {feats.shape[1]} != FEATURE_DIM "
               f"{FEATURE_DIM}", file=sys.stderr)
         sys.exit(1)
-    max_residual = float(args.max_residual
-                         if args.max_residual is not None
-                         else data["max_residual"])
+
+    # CLI > config > dataset baked value.
+    if args.max_residual is not None:
+        max_residual = float(args.max_residual)
+    elif "max_residual_osu_pms" in cfg:
+        max_residual = float(cfg["max_residual_osu_pms"])
+    else:
+        max_residual = float(data["max_residual"])
     targets = np.clip(resid / max_residual, -1.0, 1.0).astype("float32")
 
-    device = args.device if torch.cuda.is_available() else "cpu"
+    device = args.device or cfg.get("device", "cuda")
+    if device != "cpu" and not torch.cuda.is_available():
+        device = "cpu"
     print(f"[train] device={device}  samples={len(feats)}  "
           f"max_residual={max_residual} osu!px/ms")
 
     # Split
     n = len(feats)
     idx = np.random.default_rng(0).permutation(n)
-    n_val = int(n * args.val_frac)
+    n_val = int(n * val_frac)
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
 
     def _loader(ix, shuffle):
         ds = TensorDataset(torch.from_numpy(feats[ix]),
                            torch.from_numpy(targets[ix]))
-        return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle)
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
     tr_loader = _loader(tr_idx, True)
     val_loader = _loader(val_idx, False) if n_val > 0 else None
 
     net = make_motion_net().to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
     loss_fn = torch.nn.MSELoss()
 
     best_val = float("inf")
-    out = Path(args.output)
+    out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         net.train()
         tr_loss = 0.0
         for xb, yb in tr_loader:
