@@ -35,6 +35,14 @@ from src.control.motion_net import (
 
 Vec = Tuple[float, float]
 
+# Robust τ-space velocity estimation (numeric-stability constants, not tuning):
+# a single-frame Δτ ≈ dt/preempt is tiny and noisy, so dividing Δx by it blows
+# up.  We instead take the secant over a short window of frames, giving a stable
+# denominator.  The window is cleared on a segment change (ratio drop).
+_VEL_WINDOW = 6        # frames pooled for the τ-velocity secant
+_MIN_DTAU = 1e-2       # minimum ratio span before a velocity is trusted
+_RATIO_RESET = 0.05    # ratio drop that signals a new object recycled the slot
+
 
 @dataclass
 class ControlOutput:
@@ -67,8 +75,9 @@ class Controller:
 
         self._vel: Vec = (0.0, 0.0)
         self._last_t: Optional[float] = None
-        self._prev_cursor: Optional[Vec] = None
-        self._prev_primary_ratio: Optional[float] = None
+        # Short window of (tau, x, y) for the primary target, for a robust
+        # τ-space velocity.  Cleared on segment change.
+        self._vwin: list = []
 
     @property
     def motion_net_active(self) -> bool:
@@ -78,8 +87,7 @@ class Controller:
         self.reference.reset(cursor)
         self._last_t = None
         self._vel = (0.0, 0.0)
-        self._prev_cursor = cursor
-        self._prev_primary_ratio = None
+        self._vwin = []
 
     def update(
         self,
@@ -95,8 +103,7 @@ class Controller:
 
         if ref.phase == PHASE_IDLE or not self.policy.active:
             self._vel = (0.0, 0.0)
-            self._prev_cursor = cursor
-            self._prev_primary_ratio = None
+            self._vwin = []
             return ControlOutput(x=cursor[0], y=cursor[1],
                                  key_z=ref.key_z, key_x=ref.key_x)
 
@@ -111,13 +118,12 @@ class Controller:
                 return out
             # No approachable target this frame: hold.
             self._vel = (0.0, 0.0)
-            self._prev_cursor = cursor
-            self._prev_primary_ratio = None
+            self._vwin = []
             return ControlOutput(x=cursor[0], y=cursor[1],
                                  key_z=ref.key_z, key_x=ref.key_x)
 
         # ── slide / spin: velocity policy + zero-parameter geometry ──
-        self._prev_primary_ratio = None
+        self._vwin = []
         vx, vy = vel
         if ref.phase == PHASE_SLIDE:
             ball = next((t for t in ref.targets
@@ -132,7 +138,6 @@ class Controller:
                 vx, vy = spin_tangential((vx, vy), cursor, (center.x, center.y))
 
         self._vel = (vx, vy)
-        self._prev_cursor = cursor
         return ControlOutput(x=cursor[0] + vx * dt_ms, y=cursor[1] + vy * dt_ms,
                              key_z=ref.key_z, key_x=ref.key_x)
 
@@ -146,17 +151,25 @@ class Controller:
         primary = max(approach_targets, key=lambda t: t.approach_ratio)
         tau0 = primary.approach_ratio
 
-        # τ-space velocity v₀ = Δx / Δτ, measured from the observed ratio delta
-        # of the same primary target (preempt-free).  Undefined across a target
-        # switch (Δτ ≤ 0) → start from rest.
-        dtau = 0.0
-        if self._prev_cursor is not None and self._prev_primary_ratio is not None:
-            dtau = tau0 - self._prev_primary_ratio
-        if dtau > 1e-3:
-            v0 = ((cursor[0] - self._prev_cursor[0]) / dtau,
-                  (cursor[1] - self._prev_cursor[1]) / dtau)
+        # τ-space velocity v₀ = Δx / Δτ.  A single-frame Δτ is tiny and noisy
+        # (division blows up → darting), so take the secant over a short window
+        # of frames.  A ratio drop means the slot was recycled by a new object
+        # → clear the window.
+        if self._vwin and (tau0 - self._vwin[-1][0]) < -_RATIO_RESET:
+            self._vwin = []
+        self._vwin.append((tau0, cursor[0], cursor[1]))
+        if len(self._vwin) > _VEL_WINDOW:
+            self._vwin = self._vwin[-_VEL_WINDOW:]
+
+        tau_f, xf, yf = self._vwin[0]
+        tau_b, xb, yb = self._vwin[-1]
+        span = tau_b - tau_f
+        if len(self._vwin) >= 2 and span > _MIN_DTAU:
+            v0 = ((xb - xf) / span, (yb - yf) / span)
+            dtau_frame = span / (len(self._vwin) - 1)
         else:
             v0 = (0.0, 0.0)
+            dtau_frame = 0.0
 
         # Flow aim: goal velocity points toward the next object (the visible
         # target with the next-highest ratio) at the incoming τ-speed.
@@ -170,12 +183,10 @@ class Controller:
                 sp = (v0[0] * v0[0] + v0[1] * v0[1]) ** 0.5
                 vg = (sp * dx / d, sp * dy / d)
 
-        # Execute one MPC step: command the position at the next predicted ratio.
-        tau_q = min(1.0, tau0 + max(dtau, 0.0))
+        # Execute one MPC step: command the position one frame's progress ahead.
+        tau_q = min(1.0, tau0 + max(dtau_frame, 0.0))
         cmd = eval_primitive(cursor, v0, (primary.x, primary.y), vg, tau0, w, tau_q)
 
-        self._prev_primary_ratio = tau0
-        self._prev_cursor = cursor
         self._vel = ((cmd[0] - cursor[0]) / dt_ms, (cmd[1] - cursor[1]) / dt_ms)
         return ControlOutput(x=cmd[0], y=cmd[1],
                              key_z=ref.key_z, key_x=ref.key_x)
