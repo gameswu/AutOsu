@@ -58,6 +58,8 @@ _CLS_SHORT = {0: "C", 1: "SH", 2: "BALL", 3: "SP", 4: "AC"}
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", "-c", default=None,
+                   help="Path to config YAML (shares controller params with runtime)")
     p.add_argument("--data", "-d", default="raw_data",
                    help="raw_data dir (beatmaps/ + replays/)")
     p.add_argument("--index", type=int, default=0,
@@ -86,6 +88,19 @@ def main():
     from src.vision.approach_from_boxes import BoxApproachEstimator
     from src.control import Controller
 
+    # Load config
+    import yaml
+    cfg: dict = {}
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"ERROR: config not found: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    device = args.device or cfg.get("device", "cuda:0")
+
     W, H, S = args.width, args.height, max(1, args.scale)
     tf = PlayfieldTransform(W, H)
     to_osu = tf.render_to_osu
@@ -105,18 +120,38 @@ def main():
     print(f"Replay:  {osr_path.name}")
 
     # ── Load models ───────────────────────────────────────────────────────
-    det_path = Path(args.detector)
+    det_path = Path(args.detector or cfg.get("detector_path",
+                    "runs/detect/train/weights/best.pt"))
     if not det_path.exists():
         print(f"ERROR: detector not found: {det_path}", file=sys.stderr)
         sys.exit(1)
-    detector = Detector(det_path, device=args.device, conf_threshold=args.conf,
+    detector = Detector(det_path, device=device,
+                        conf_threshold=args.conf,
                         iou_threshold=args.iou, imgsz=(H, W))
     detector.load()
     print(f"Detector: {det_path.name}")
 
     approach = BoxApproachEstimator()
     approach.reset()
-    controller = Controller(motion_net_path=args.motion_net, device=args.device)
+    controller = Controller(
+        hit_window=cfg.get("hit_window", 0.90),
+        tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
+        tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
+        spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
+        spin_speed=cfg.get("spin_speed", 0.025),
+        slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
+        slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
+        spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
+        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 3.0),
+        max_accel_osu_pms2=cfg.get("max_accel_osu_pms2", 0.20),
+        seek_tau_ms=cfg.get("seek_tau_ms", 45.0),
+        aim_cut_fraction=cfg.get("aim_cut_fraction", 0.65),
+        lookahead_n=cfg.get("lookahead_n", 3),
+        motion_net_path=args.motion_net or cfg.get("motion_net_path"),
+        max_residual_osu_pms=cfg.get("max_residual_osu_pms", 1.5),
+        style_scale=cfg.get("style_scale", 1.0),
+        device=device,
+    )
 
     # ── Video writer ──────────────────────────────────────────────────────
     out_path = Path(args.output)

@@ -57,7 +57,6 @@ class Controller:
         aim_cut_fraction: float = 0.65,
         lookahead_n: int = 3,
         device: str = "cpu",
-        seed: Optional[int] = None,
     ):
         self.max_speed = float(max_speed_osu_pms)
         self.max_accel = float(max_accel_osu_pms2)
@@ -81,7 +80,6 @@ class Controller:
             spin_grace_ms=spin_grace_ms,
             aim_cut_fraction=aim_cut_fraction,
             lookahead_n=lookahead_n,
-            seed=seed,
         )
 
         self._prev_cursor: Vec = (256.0, 192.0)

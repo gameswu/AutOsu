@@ -36,7 +36,9 @@ class PipelineConfig:
     # Controller
     hit_window: float = 0.90
     tap_hold_ms: float = 40.0
+    tap_refractory_ms: float = 70.0
     spin_radius_osu: float = 60.0
+    spin_speed: float = 0.025
     slide_follow_radius_osu: float = 120.0
     slide_grace_ms: float = 90.0
     spin_grace_ms: float = 120.0
@@ -103,7 +105,9 @@ class GamePipeline:
         self._controller = Controller(
             hit_window=self.config.hit_window,
             tap_hold_ms=self.config.tap_hold_ms,
+            tap_refractory_ms=self.config.tap_refractory_ms,
             spin_radius_osu=self.config.spin_radius_osu,
+            spin_speed=self.config.spin_speed,
             slide_follow_radius_osu=self.config.slide_follow_radius_osu,
             slide_grace_ms=self.config.slide_grace_ms,
             spin_grace_ms=self.config.spin_grace_ms,

@@ -180,7 +180,8 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
 # ── driver ──────────────────────────────────────────────────────────────────
 
 def build(data_dir: str, fps: int, max_replays: Optional[int],
-          max_residual: float, max_speed: float, seek_tau: float):
+          max_residual: float, max_speed: float, seek_tau: float,
+          ref_kwargs: Optional[dict] = None):
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
     from src.control.reference import ReferenceController
@@ -191,6 +192,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
         print(f"ERROR: no (beatmap, replay) pairs found in {data_dir}", file=sys.stderr)
         sys.exit(1)
 
+    rk = ref_kwargs or {}
     dt = 1000.0 / float(fps)
     feats_all: List[List[float]] = []
     resid_all: List[Tuple[float, float]] = []
@@ -224,7 +226,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
             lo = max(t_start, rs)
             hi = min(t_end, re)
 
-            rc = ReferenceController()
+            rc = ReferenceController(**rk)
             cur = track.at(lo)
             rc.reset(cursor=cur)
             prev = cur
@@ -267,6 +269,8 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
 def main():
     ap = argparse.ArgumentParser(
         description="Build a motion-policy dataset from real osu! replays.")
+    ap.add_argument("--config", "-c", default=None,
+                    help="Path to config YAML (shares controller params with runtime)")
     ap.add_argument("--data", "-d", default="raw_data",
                     help="raw_data dir (beatmaps/ + replays/)")
     ap.add_argument("--output", "-o", default="runs/motion/dataset.npz",
@@ -275,20 +279,53 @@ def main():
                     help="resampling rate for the reference simulation")
     ap.add_argument("--max-replays", "-n", type=int, default=None,
                     help="cap the number of replays processed")
-    ap.add_argument("--max-residual", type=float, default=1.5,
-                    help="clip |style residual| to this (osu!px/ms); MUST match "
-                         "training / MotionPolicy.max_residual_osu_pms")
-    ap.add_argument("--max-speed", type=float, default=3.0,
-                    help="deterministic seek speed cap (osu!px/ms); MUST match "
-                         "the runtime controller")
-    ap.add_argument("--seek-tau", type=float, default=45.0,
-                    help="deterministic seek time constant (ms); MUST match "
-                         "the runtime controller")
+    ap.add_argument("--max-residual", type=float, default=None,
+                    help="clip |style residual| (osu!px/ms); default from config or 1.5")
+    ap.add_argument("--max-speed", type=float, default=None,
+                    help="deterministic seek speed cap (osu!px/ms); default from config or 3.0")
+    ap.add_argument("--seek-tau", type=float, default=None,
+                    help="deterministic seek time constant (ms); default from config or 45.0")
     args = ap.parse_args()
 
-    feats, resid, n_replays = build(args.data, args.fps, args.max_replays,
-                                    args.max_residual, args.max_speed,
-                                    args.seek_tau)
+    import yaml
+    cfg: dict = {}
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"ERROR: config not found: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    # CLI overrides config; config overrides built-in defaults.
+    max_residual = args.max_residual or cfg.get("max_residual_osu_pms", 1.5)
+    max_speed = args.max_speed or cfg.get("max_speed_osu_pms", 3.0)
+    seek_tau = args.seek_tau or cfg.get("seek_tau_ms", 45.0)
+
+    # ReferenceController kwargs — must match the runtime controller.
+    ref_kwargs = {
+        "hit_window": cfg.get("hit_window", 0.90),
+        "tap_hold_ms": cfg.get("tap_hold_ms", 40.0),
+        "tap_refractory_ms": cfg.get("tap_refractory_ms", 70.0),
+        "spin_radius_osu": cfg.get("spin_radius_osu", 60.0),
+        "spin_speed": cfg.get("spin_speed", 0.025),
+        "slide_follow_radius_osu": cfg.get("slide_follow_radius_osu", 120.0),
+        "slide_grace_ms": cfg.get("slide_grace_ms", 90.0),
+        "spin_grace_ms": cfg.get("spin_grace_ms", 120.0),
+        "aim_cut_fraction": cfg.get("aim_cut_fraction", 0.65),
+        "lookahead_n": cfg.get("lookahead_n", 3),
+    }
+
+    data_dir = args.data if args.data != "raw_data" else cfg.get("data", {}).get("raw_data_dir", "raw_data")
+
+    print(f"[build_motion] max_speed={max_speed}  seek_tau={seek_tau}  "
+          f"max_residual={max_residual}")
+    print(f"[build_motion] aim_cut_fraction={ref_kwargs['aim_cut_fraction']}  "
+          f"lookahead_n={ref_kwargs['lookahead_n']}")
+
+    feats, resid, n_replays = build(data_dir, args.fps, args.max_replays,
+                                    max_residual, max_speed, seek_tau,
+                                    ref_kwargs=ref_kwargs)
 
     import numpy as np
     out = Path(args.output)
@@ -297,17 +334,17 @@ def main():
         out,
         features=np.asarray(feats, dtype=np.float32),
         residual=np.asarray(resid, dtype=np.float32),
-        max_residual=np.float32(args.max_residual),
-        max_speed=np.float32(args.max_speed),
-        seek_tau=np.float32(args.seek_tau),
+        max_residual=np.float32(max_residual),
+        max_speed=np.float32(max_speed),
+        seek_tau=np.float32(seek_tau),
         fps=np.int32(args.fps),
     )
 
     print("\n── dataset ─────────────────────────────")
     print(f"  replays      : {n_replays}")
     print(f"  samples      : {len(feats)}")
-    print(f"  max_residual : {args.max_residual} osu!px/ms")
-    print(f"  max_speed    : {args.max_speed} osu!px/ms  (seek_tau={args.seek_tau} ms)")
+    print(f"  max_residual : {max_residual} osu!px/ms")
+    print(f"  max_speed    : {max_speed} osu!px/ms  (seek_tau={seek_tau} ms)")
     print(f"\nWrote {out}")
 
 

@@ -122,23 +122,25 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate training data from raw_data (beatmaps + replays)"
     )
-    parser.add_argument("--data", "-d", required=True,
+    parser.add_argument("--config", "-c", default=None,
+                        help="Path to config YAML (reads data.* section for defaults)")
+    parser.add_argument("--data", "-d", default=None,
                         help="raw_data directory (must contain beatmaps/ and replays/)")
-    parser.add_argument("--skin", "-s", required=True,
+    parser.add_argument("--skin", "-s", default=None,
                         help="Path to the osu! skin directory")
-    parser.add_argument("--output", "-o", default="dataset",
+    parser.add_argument("--output", "-o", default=None,
                         help="Output directory (default: dataset)")
-    parser.add_argument("--width", type=int, default=640,
+    parser.add_argument("--width", type=int, default=None,
                         help="Render width (default: 640)")
-    parser.add_argument("--height", type=int, default=384,
+    parser.add_argument("--height", type=int, default=None,
                         help="Render height (default: 384)")
-    parser.add_argument("--fps", type=int, default=30,
+    parser.add_argument("--fps", type=int, default=None,
                         help="Sampling FPS (default: 30)")
     parser.add_argument("--max-beatmaps", "-n", type=int, default=None,
                         help="Maximum number of beatmaps to use")
-    parser.add_argument("--train-ratio", type=float, default=0.85,
+    parser.add_argument("--train-ratio", type=float, default=None,
                         help="Train/val split ratio (default: 0.85)")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (default: 42)")
     parser.add_argument("--no-balance", action="store_true",
                         help="Disable class-balancing oversampling of the train split")
@@ -146,34 +148,61 @@ def main():
                         help="Max number of duplicates per image when balancing (default: 8)")
     args = parser.parse_args()
 
+    # Load config
+    import yaml
+    cfg: dict = {}
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"ERROR: config not found: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    data_cfg = cfg.get("data", {}) or {}
+
+    # CLI overrides config; config overrides built-in defaults.
+    data_dir = args.data or data_cfg.get("raw_data_dir", "raw_data")
+    skin_path = args.skin or data_cfg.get("skin_dir")
+    output_dir = args.output or data_cfg.get("output_dir", "dataset")
+    width = args.width or data_cfg.get("render_width", 640)
+    height = args.height or data_cfg.get("render_height", 384)
+    fps = args.fps or data_cfg.get("fps", 30)
+    max_beatmaps = args.max_beatmaps or data_cfg.get("max_beatmaps")
+    train_ratio = args.train_ratio if args.train_ratio is not None else data_cfg.get("train_ratio", 0.85)
+    seed = args.seed if args.seed is not None else data_cfg.get("seed", 42)
+
+    if not skin_path:
+        print("ERROR: skin path required (--skin or data.skin_dir in config)")
+        sys.exit(1)
+
     from src.data.replay_parser import find_replay_pairs
     from src.data.renderer import Osr2mp4Renderer, PlayfieldTransform
 
     # Find (osu, [osr]) pairs by MD5 matching
-    pairs = find_replay_pairs(args.data)
+    pairs = find_replay_pairs(data_dir)
     if not pairs:
-        print(f"ERROR: No (beatmap, replay) pairs found in {args.data}", file=sys.stderr)
+        print(f"ERROR: No (beatmap, replay) pairs found in {data_dir}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(pairs)} matched (beatmap, replay) groups")
 
     # Subsample if needed
-    if args.max_beatmaps and len(pairs) > args.max_beatmaps:
-        random.seed(args.seed)
-        pairs = random.sample(pairs, args.max_beatmaps)
-        print(f"Sampled {args.max_beatmaps} (seed={args.seed})")
+    if max_beatmaps and len(pairs) > max_beatmaps:
+        random.seed(seed)
+        pairs = random.sample(pairs, max_beatmaps)
+        print(f"Sampled {max_beatmaps} (seed={seed})")
 
     # Setup output dirs
-    out = Path(args.output)
+    out = Path(output_dir)
     (out / "images" / "train").mkdir(parents=True, exist_ok=True)
     (out / "images" / "val").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "train").mkdir(parents=True, exist_ok=True)
     (out / "labels" / "val").mkdir(parents=True, exist_ok=True)
 
     # Coordinate transform for YOLO labels
-    tf = PlayfieldTransform(args.width, args.height)
+    tf = PlayfieldTransform(width, height)
 
-    random.seed(args.seed)
+    random.seed(seed)
     total_frames = 0
 
     for pair_idx, (osu_path, osr_paths) in enumerate(pairs):
@@ -183,8 +212,8 @@ def main():
         for osr_path in osr_paths:
             try:
                 renderer, frame_iter = open_replay_frames(
-                    osu_path, osr_path, args.skin,
-                    args.width, args.height, args.fps,
+                    osu_path, osr_path, skin_path,
+                    width, height, fps,
                 )
             except Exception as e:
                 print(f"  Skip replay (renderer init error): {osr_path.name}: {e}")
@@ -193,7 +222,7 @@ def main():
             print(f"  Processing: {osr_path.name} (~{renderer.total_frames_estimate} frames)")
 
             # Train/val split per replay
-            is_train = random.random() < args.train_ratio
+            is_train = random.random() < train_ratio
             split = "train" if is_train else "val"
 
             for fd in frame_iter:
@@ -205,7 +234,7 @@ def main():
                     # Generate YOLO labels
                     labels = _generate_labels(
                         visible, t_ms, time_preempt, radius_osu,
-                        tf, args.width, args.height,
+                        tf, width, height,
                     )
 
                     if labels:

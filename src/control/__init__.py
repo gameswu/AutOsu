@@ -2,7 +2,6 @@
 
 from src.control.controller import Controller, ControlOutput
 from src.control.reference import ReferenceController, Reference
-from src.control.motion import MotionProfile
 from src.control.motion_net import (
     MotionPolicy,
     MotionPolicyError,
@@ -21,7 +20,6 @@ __all__ = [
     "ControlOutput",
     "ReferenceController",
     "Reference",
-    "MotionProfile",
     "MotionPolicy",
     "MotionPolicyError",
     "seek_velocity",

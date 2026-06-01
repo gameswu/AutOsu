@@ -16,7 +16,9 @@ target_fps: 120
 # Controller
 hit_window: 0.90
 tap_hold_ms: 40.0
+tap_refractory_ms: 70.0
 spin_radius_osu: 60.0
+spin_speed: 0.025
 slide_follow_radius_osu: 120.0
 slide_grace_ms: 90.0
 spin_grace_ms: 120.0

@@ -59,7 +59,6 @@ class ReferenceController:
         spin_grace_ms: float = 120.0,
         aim_cut_fraction: float = 0.65,
         lookahead_n: int = 3,
-        seed: Optional[int] = None,
     ):
         self.hit_window = hit_window
         self.tap_hold_ms = tap_hold_ms

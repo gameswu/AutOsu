@@ -3,8 +3,8 @@ Replay parser and frame-level data extractor.
 
 Parses .osr replay files (via osrparse) and aligns cursor/key data with
 beatmap timestamps to produce absolute-time cursor/key frames. Used offline by
-dataset generation (cursor rendering) and by `scripts/analyze_motion.py`
-(human-motion statistics). Not used at runtime — the live player is vision-only.
+dataset generation (cursor rendering) and by `scripts/build_motion_dataset.py`
+(style-residual dataset). Not used at runtime — the live player is vision-only.
 
 Data organisation::
 

@@ -23,7 +23,6 @@ capture = ["dxcam>=0.0.5", "mss>=9.0"]
 autosu-run = "scripts.run:main"
 autosu-generate = "scripts.generate_dataset:main"
 autosu-train-detect = "scripts.train_detector:main"
-autosu-analyze-motion = "scripts.analyze_motion:main"
 autosu-build-motion-dataset = "scripts.build_motion_dataset:main"
 autosu-train-motion = "scripts.train_motion:main"
 
