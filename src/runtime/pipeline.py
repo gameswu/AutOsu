@@ -33,25 +33,15 @@ class PipelineConfig:
     target_fps: int = 120
     use_tensorrt: bool = False
 
-    # Controller
+    # Controller (key-press timing — rule-based, kept)
     hit_window: float = 0.90
     tap_hold_ms: float = 40.0
     tap_refractory_ms: float = 70.0
-    spin_radius_osu: float = 60.0
-    spin_speed: float = 0.025
-    slide_follow_radius_osu: float = 120.0
     slide_grace_ms: float = 90.0
     spin_grace_ms: float = 120.0
-    max_speed_osu_pms: float = 3.0
-    max_accel_osu_pms2: float = 0.20
-    seek_tau_ms: float = 45.0
-    aim_cut_fraction: float = 0.65
-    lookahead_n: int = 3
 
-    # Style residual (optional)
+    # Trajectory model (learned cursor motion)
     motion_net_path: Optional[str] = None
-    max_residual_osu_pms: float = 1.5
-    style_scale: float = 1.0
 
 
 class GamePipeline:
@@ -106,28 +96,13 @@ class GamePipeline:
             hit_window=self.config.hit_window,
             tap_hold_ms=self.config.tap_hold_ms,
             tap_refractory_ms=self.config.tap_refractory_ms,
-            spin_radius_osu=self.config.spin_radius_osu,
-            spin_speed=self.config.spin_speed,
-            slide_follow_radius_osu=self.config.slide_follow_radius_osu,
             slide_grace_ms=self.config.slide_grace_ms,
             spin_grace_ms=self.config.spin_grace_ms,
-            max_speed_osu_pms=self.config.max_speed_osu_pms,
-            max_accel_osu_pms2=self.config.max_accel_osu_pms2,
-            seek_tau_ms=self.config.seek_tau_ms,
-            aim_cut_fraction=self.config.aim_cut_fraction,
-            lookahead_n=self.config.lookahead_n,
             motion_net_path=self.config.motion_net_path,
-            max_residual_osu_pms=self.config.max_residual_osu_pms,
-            style_scale=self.config.style_scale,
             device=self.config.device,
         )
-        mode = ("seek + style" if self._controller.motion_net_active
-                else "seek only")
-        print(f"[Pipeline] Controller: {mode} "
-              f"(spd={self.config.max_speed_osu_pms}, "
-              f"acc={self.config.max_accel_osu_pms2}, "
-              f"tau={self.config.seek_tau_ms}, "
-              f"cut={self.config.aim_cut_fraction})")
+        mode = "learned" if self._controller.motion_net_active else "inactive"
+        print(f"[Pipeline] Controller: trajectory model {mode}")
 
         region = self._mapping.capture_region
         self._capture = ScreenCapture(

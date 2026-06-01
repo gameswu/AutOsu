@@ -52,7 +52,7 @@ COL_HUD = (255, 255, 255)
 COL_KEY_ON = (60, 220, 60)
 COL_KEY_OFF = (90, 90, 90)
 
-_CLS_SHORT = {0: "C", 1: "SH", 2: "BALL", 3: "SP", 4: "AC"}
+_CLS_SHORT = {0: "C", 1: "SH", 2: "BALL", 3: "SP", 4: "AC", 5: "BODY"}
 
 
 def main():
@@ -137,19 +137,9 @@ def main():
         hit_window=cfg.get("hit_window", 0.90),
         tap_hold_ms=cfg.get("tap_hold_ms", 40.0),
         tap_refractory_ms=cfg.get("tap_refractory_ms", 70.0),
-        spin_radius_osu=cfg.get("spin_radius_osu", 60.0),
-        spin_speed=cfg.get("spin_speed", 0.025),
-        slide_follow_radius_osu=cfg.get("slide_follow_radius_osu", 120.0),
         slide_grace_ms=cfg.get("slide_grace_ms", 90.0),
         spin_grace_ms=cfg.get("spin_grace_ms", 120.0),
-        max_speed_osu_pms=cfg.get("max_speed_osu_pms", 3.0),
-        max_accel_osu_pms2=cfg.get("max_accel_osu_pms2", 0.20),
-        seek_tau_ms=cfg.get("seek_tau_ms", 45.0),
-        aim_cut_fraction=cfg.get("aim_cut_fraction", 0.65),
-        lookahead_n=cfg.get("lookahead_n", 3),
         motion_net_path=args.motion_net or cfg.get("motion_net_path"),
-        max_residual_osu_pms=cfg.get("max_residual_osu_pms", 1.5),
-        style_scale=cfg.get("style_scale", 1.0),
         device=device,
     )
 

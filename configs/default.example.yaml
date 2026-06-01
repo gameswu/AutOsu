@@ -13,34 +13,20 @@ use_dxcam: true
 
 target_fps: 120
 
-# Controller
+# Controller (key-press timing — rule-based)
 hit_window: 0.90
 tap_hold_ms: 40.0
 tap_refractory_ms: 70.0
-spin_radius_osu: 60.0
-spin_speed: 0.025
-slide_follow_radius_osu: 120.0
 slide_grace_ms: 90.0
 spin_grace_ms: 120.0
-max_speed_osu_pms: 3.0
-max_accel_osu_pms2: 0.20
-seek_tau_ms: 45.0
 
-# Aim-point offset: fraction of hit-circle radius to shift toward next target.
-# Higher = more aggressive corner-cutting. Hit radius is auto-estimated from
-# detection boxes.
-aim_cut_fraction: 0.65
-lookahead_n: 3
-
-# Style residual (optional, leave unset for pure seek)
-# motion_net_path: "runs/motion/motion_net.pt"
-max_residual_osu_pms: 1.5
-style_scale: 1.0
+# Trajectory model (learned cursor motion)
+# motion_net_path: "runs/motion/trajectory.pt"
 
 # Motion training (scripts/train_motion.py -c config.yaml)
 motion_training:
   dataset: "runs/motion/dataset.npz"
-  output: "runs/motion/motion_net.pt"
+  output: "runs/motion/trajectory.pt"
   epochs: 60
   batch_size: 4096
   lr: 0.001

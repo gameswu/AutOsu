@@ -2,34 +2,29 @@
 """
 Offline motion-policy dataset builder.
 
-Reconstructs the deterministic *navigation goal* frame-by-frame from beatmap
-ground truth (no rendering, geometry only), pairs it with the real human cursor
-from the matched replay, and records the supervised target — the human cursor
-velocity **minus the deterministic seek**, i.e. the *style residual* the runtime
-adds on top of :func:`src.control.motion_net.seek_velocity`::
+Reconstructs the scene frame-by-frame from beatmap ground truth (no rendering,
+geometry only), pairs it with the real human cursor from the matched replay,
+and records the supervised target — the **full human cursor velocity** (not a
+residual) together with the scene context the trajectory model consumes.
 
-    v_human(t) = (human_cursor(t + dt) - human_cursor(t)) / dt
-    v_ref(t)   = seek_velocity(goal(t), human_cursor(t))
-    residual(t)= clip(v_human(t) - v_ref(t), +/- max_residual)
+For each timestep:
+  - cursor_state:  (cx, cy, vx, vy, phase_one_hot×4)
+  - targets:       variable-length list of (dx, dy, tth, ratio, circle, slider,
+                   spinner, active), padded to MAX_TARGETS
+  - target_mask:   bool mask for valid targets
+  - velocity:      (vx, vy) in osu!px/ms — raw human cursor velocity
 
-together with the goal-relative features the policy consumes
-(:func:`src.control.motion_net.build_features`). The residual (not the full
-velocity) is the label so the deterministic seek guarantees convergence and the
-net only learns the human *style* on top of it. Velocity units (osu!px/ms) make
-it resampling-rate independent.
+Output is a ``.npz`` with arrays ready for training::
 
-This runs **entirely offline** on matched (.osu, .osr) pairs. The runtime player
-never reads beatmaps or replays — this only distils *how* humans deviate from
-the straight seek into training data for ``scripts/train_motion.py``.
-
-Output is a ``.npz`` with ``features`` (N, FEATURE_DIM) and ``residual`` (N, 2,
-osu!px/ms). Train with the **same** ``--max-residual`` / ``--max-speed`` /
-``--seek-tau`` the runtime controller uses.
+    cursor_features: (N, CURSOR_DIM)
+    target_features: (N, MAX_TARGETS, TARGET_DIM)
+    target_masks:    (N, MAX_TARGETS)
+    velocities:      (N, 2)
 
 Usage::
 
-    python scripts/build_motion_dataset.py --data raw_data --output runs/motion/dataset.npz
-    python scripts/build_motion_dataset.py --data raw_data --fps 60 --max-replays 50
+    python scripts/build_motion_dataset.py -d raw_data -o runs/motion/dataset.npz
+    python scripts/build_motion_dataset.py -d raw_data --fps 60 --max-replays 50
 """
 
 from __future__ import annotations
@@ -40,7 +35,6 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# Ensure project root is on sys.path so `from src.xxx` works
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -147,7 +141,6 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
     """Build a (Scene, new_start_idx) for time ``t``."""
     from src.control.planner import Scene, SceneObject
 
-    # Advance past objects that have fully ended.
     while start_idx < len(objs) and objs[start_idx].end < t:
         start_idx += 1
 
@@ -180,12 +173,15 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
 # ── driver ──────────────────────────────────────────────────────────────────
 
 def build(data_dir: str, fps: int, max_replays: Optional[int],
-          max_residual: float, max_speed: float, seek_tau: float,
           ref_kwargs: Optional[dict] = None):
+    import numpy as np
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
-    from src.control.reference import ReferenceController
-    from src.control.motion_net import build_features, seek_velocity
+    from src.control.reference import ReferenceController, build_targets
+    from src.control.motion_net import (
+        build_cursor_features, build_target_features,
+        CURSOR_DIM, TARGET_DIM, MAX_TARGETS,
+    )
 
     pairs = find_replay_pairs(data_dir)
     if not pairs:
@@ -194,8 +190,11 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
 
     rk = ref_kwargs or {}
     dt = 1000.0 / float(fps)
-    feats_all: List[List[float]] = []
-    resid_all: List[Tuple[float, float]] = []
+
+    cursor_all: list = []
+    target_all: list = []
+    mask_all: list = []
+    vel_all: list = []
     n_replays = 0
 
     for osu_path, osr_paths in pairs:
@@ -209,6 +208,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
             continue
         t_start = min(o.appear for o in objs)
         t_end = max(o.end for o in objs)
+        preempt = bm.difficulty.preempt_ms
 
         for osr_path in osr_paths:
             if max_replays is not None and n_replays >= max_replays:
@@ -229,9 +229,12 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
             rc = ReferenceController(**rk)
             cur = track.at(lo)
             rc.reset(cursor=cur)
-            prev = cur
+            prev_cur = cur
+            prev_vel: Vec = (0.0, 0.0)
             start_idx = 0
             kept = 0
+
+            tth_fn = lambda r, _p=preempt: (1.0 - r) * _p  # noqa: E731
 
             t = lo
             while t <= hi:
@@ -239,18 +242,35 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
                 nxt = track.at(t + dt)
                 scene, start_idx = _scene_at(objs, start_idx, t)
                 ref = rc.step(scene, cur, t)
+
                 if ref.phase != "idle":
-                    # Human velocity minus the deterministic seek -> style residual.
                     vhx = (nxt[0] - cur[0]) / dt
                     vhy = (nxt[1] - cur[1]) / dt
-                    vrx, vry = seek_velocity((ref.x, ref.y), cur,
-                                             max_speed, seek_tau)
-                    rx = max(-max_residual, min(max_residual, vhx - vrx))
-                    ry = max(-max_residual, min(max_residual, vhy - vry))
-                    feats_all.append(build_features(ref, cur, prev, dt))
-                    resid_all.append((rx, ry))
+
+                    cur_vel = prev_vel
+                    cf = build_cursor_features(cur, cur_vel, ref.phase)
+                    tf, tm = build_target_features(cur, ref.targets, tth_fn)
+
+                    # Pad / truncate to MAX_TARGETS.
+                    n_tgt = len(tf)
+                    if n_tgt < MAX_TARGETS:
+                        tf.extend([[0.0] * TARGET_DIM] * (MAX_TARGETS - n_tgt))
+                        tm.extend([False] * (MAX_TARGETS - n_tgt))
+                    elif n_tgt > MAX_TARGETS:
+                        tf = tf[:MAX_TARGETS]
+                        tm = tm[:MAX_TARGETS]
+
+                    cursor_all.append(cf)
+                    target_all.append(tf)
+                    mask_all.append(tm)
+                    vel_all.append([vhx, vhy])
+
+                    prev_vel = (vhx, vhy)
                     kept += 1
-                prev = cur
+                else:
+                    prev_vel = (0.0, 0.0)
+
+                prev_cur = cur
                 t += dt
 
             print(f"  [{n_replays}] {osu_path.parent.name}/{osr_path.name} "
@@ -259,16 +279,16 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
         if max_replays is not None and n_replays >= max_replays:
             break
 
-    if not feats_all:
+    if not cursor_all:
         print("ERROR: no samples produced", file=sys.stderr)
         sys.exit(1)
 
-    return feats_all, resid_all, n_replays
+    return cursor_all, target_all, mask_all, vel_all, n_replays
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Build a motion-policy dataset from real osu! replays.")
+        description="Build a trajectory-model dataset from real osu! replays.")
     ap.add_argument("--config", "-c", default=None,
                     help="Path to config YAML (shares controller params with runtime)")
     ap.add_argument("--data", "-d", default="raw_data",
@@ -279,12 +299,6 @@ def main():
                     help="resampling rate for the reference simulation")
     ap.add_argument("--max-replays", "-n", type=int, default=None,
                     help="cap the number of replays processed")
-    ap.add_argument("--max-residual", type=float, default=None,
-                    help="clip |style residual| (osu!px/ms); default from config or 1.5")
-    ap.add_argument("--max-speed", type=float, default=None,
-                    help="deterministic seek speed cap (osu!px/ms); default from config or 3.0")
-    ap.add_argument("--seek-tau", type=float, default=None,
-                    help="deterministic seek time constant (ms); default from config or 45.0")
     args = ap.parse_args()
 
     import yaml
@@ -297,54 +311,42 @@ def main():
         with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
-    # CLI overrides config; config overrides built-in defaults.
-    max_residual = args.max_residual or cfg.get("max_residual_osu_pms", 1.5)
-    max_speed = args.max_speed or cfg.get("max_speed_osu_pms", 3.0)
-    seek_tau = args.seek_tau or cfg.get("seek_tau_ms", 45.0)
-
-    # ReferenceController kwargs — must match the runtime controller.
     ref_kwargs = {
         "hit_window": cfg.get("hit_window", 0.90),
         "tap_hold_ms": cfg.get("tap_hold_ms", 40.0),
         "tap_refractory_ms": cfg.get("tap_refractory_ms", 70.0),
-        "spin_radius_osu": cfg.get("spin_radius_osu", 60.0),
-        "spin_speed": cfg.get("spin_speed", 0.025),
-        "slide_follow_radius_osu": cfg.get("slide_follow_radius_osu", 120.0),
         "slide_grace_ms": cfg.get("slide_grace_ms", 90.0),
         "spin_grace_ms": cfg.get("spin_grace_ms", 120.0),
-        "aim_cut_fraction": cfg.get("aim_cut_fraction", 0.65),
-        "lookahead_n": cfg.get("lookahead_n", 3),
     }
 
-    data_dir = args.data if args.data != "raw_data" else cfg.get("data", {}).get("raw_data_dir", "raw_data")
+    data_dir = args.data
+    if args.data == "raw_data":
+        data_dir = cfg.get("data", {}).get("raw_data_dir", "raw_data")
 
-    print(f"[build_motion] max_speed={max_speed}  seek_tau={seek_tau}  "
-          f"max_residual={max_residual}")
-    print(f"[build_motion] aim_cut_fraction={ref_kwargs['aim_cut_fraction']}  "
-          f"lookahead_n={ref_kwargs['lookahead_n']}")
+    print(f"[build_motion] fps={args.fps}  ref_kwargs={ref_kwargs}")
 
-    feats, resid, n_replays = build(data_dir, args.fps, args.max_replays,
-                                    max_residual, max_speed, seek_tau,
-                                    ref_kwargs=ref_kwargs)
+    cursor_all, target_all, mask_all, vel_all, n_replays = build(
+        data_dir, args.fps, args.max_replays, ref_kwargs=ref_kwargs,
+    )
 
     import numpy as np
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out,
-        features=np.asarray(feats, dtype=np.float32),
-        residual=np.asarray(resid, dtype=np.float32),
-        max_residual=np.float32(max_residual),
-        max_speed=np.float32(max_speed),
-        seek_tau=np.float32(seek_tau),
+        cursor_features=np.asarray(cursor_all, dtype=np.float32),
+        target_features=np.asarray(target_all, dtype=np.float32),
+        target_masks=np.asarray(mask_all, dtype=np.bool_),
+        velocities=np.asarray(vel_all, dtype=np.float32),
         fps=np.int32(args.fps),
     )
 
     print("\n── dataset ─────────────────────────────")
     print(f"  replays      : {n_replays}")
-    print(f"  samples      : {len(feats)}")
-    print(f"  max_residual : {max_residual} osu!px/ms")
-    print(f"  max_speed    : {max_speed} osu!px/ms  (seek_tau={seek_tau} ms)")
+    print(f"  samples      : {len(cursor_all)}")
+    print(f"  cursor_dim   : {len(cursor_all[0])}")
+    print(f"  max_targets  : {len(target_all[0])}")
+    print(f"  target_dim   : {len(target_all[0][0])}")
     print(f"\nWrote {out}")
 
 

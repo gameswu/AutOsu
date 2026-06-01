@@ -5,8 +5,8 @@ Generate training data from raw_data/ (beatmaps + replays).
 Produces a YOLO detection dataset (images + labels) with the cursor rendered.
 Classes: 0 hitcircle, 1 slider_head, 2 slider_ball (follow-circle target during
 an active slide), 3 spinner, 4 approach_circle (ring; box size encodes approach
-ratio). Sliders are represented purely by head (approach phase) + ball (slide
-phase); the noisy body/end boxes are intentionally omitted.
+ratio), 5 slider_body (visible slider path; slider-active signal).
+Slider body label generation is TODO — currently only classes 0–4 are emitted.
 
 Input data structure::
 

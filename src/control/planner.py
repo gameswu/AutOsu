@@ -26,6 +26,7 @@ class SceneObject:
 class Scene:
     objects: List[SceneObject]
     spinner: Optional[SceneObject] = None
+    has_slider_body: bool = False  # any SLIDER_BODY detection present
 
     @property
     def actionables(self) -> List[SceneObject]:
@@ -92,7 +93,8 @@ def build_scene(
                                    head_visible=False,
                                    ball_x=bx, ball_y=by, has_ball=True))
 
-    return Scene(objects=objects, spinner=spinner)
+    return Scene(objects=objects, spinner=spinner,
+                has_slider_body=len(detections.slider_bodies) > 0)
 
 
 def _round(v: Optional[float]) -> Optional[int]:

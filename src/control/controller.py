@@ -1,12 +1,11 @@
 """Vision-only motion controller.
 
-Composition per frame::
+Per-frame composition::
 
-    goal, keys = reference(scene)                 # navigation + keys
-    v_ref      = seek_velocity(goal, cursor)      # deterministic, converges
-    v_style    = policy.residual(features)         # learned, bounded (optional)
-    v          = accel_limit(v_prev, v_ref + gate*v_style)
-    cursor(t)  = cursor(t-1) + v * dt
+    targets, keys, phase = reference(scene)
+    v = trajectory_model(cursor, velocity, phase, targets)
+    v = arrival_safeguard(v, cursor, primary_target, tth)   # approach only
+    cursor(t) = cursor(t-1) + v * dt
 """
 
 from __future__ import annotations
@@ -15,15 +14,10 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from src.vision.detector import FrameDetections
-from src.control.reference import ReferenceController, PHASE_IDLE, VK_Z, VK_X  # noqa: F401
+from src.control.reference import ReferenceController, PHASE_IDLE, PHASE_APPROACH, VK_Z, VK_X  # noqa: F401
 from src.control.motion_net import (
-    MotionPolicy,
-    seek_velocity,
-    limit_velocity_change,
-    MAX_SPEED_OSU_PMS,
-    MAX_ACCEL_OSU_PMS2,
-    MAX_RESIDUAL_OSU_PMS,
-    SEEK_TAU_MS,
+    TrajectoryPolicy,
+    arrival_safeguard,
 )
 
 Vec = Tuple[float, float]
@@ -43,46 +37,21 @@ class Controller:
         hit_window: float = 0.90,
         tap_hold_ms: float = 40.0,
         tap_refractory_ms: float = 70.0,
-        spin_radius_osu: float = 60.0,
-        spin_speed: float = 0.025,
-        slide_follow_radius_osu: float = 120.0,
         slide_grace_ms: float = 90.0,
         spin_grace_ms: float = 120.0,
-        max_speed_osu_pms: float = MAX_SPEED_OSU_PMS,
-        max_accel_osu_pms2: float = MAX_ACCEL_OSU_PMS2,
-        seek_tau_ms: float = SEEK_TAU_MS,
         motion_net_path: Optional[str] = None,
-        max_residual_osu_pms: float = MAX_RESIDUAL_OSU_PMS,
-        style_scale: float = 1.0,
-        aim_cut_fraction: float = 0.65,
-        lookahead_n: int = 3,
         device: str = "cpu",
     ):
-        self.max_speed = float(max_speed_osu_pms)
-        self.max_accel = float(max_accel_osu_pms2)
-        self.seek_tau_ms = float(seek_tau_ms)
-
-        self.policy = MotionPolicy(
-            motion_net_path,
-            max_residual_osu_pms=max_residual_osu_pms,
-            scale=style_scale,
-            device=device,
-        )
+        self.policy = TrajectoryPolicy(motion_net_path, device=device)
 
         self.reference = ReferenceController(
             hit_window=hit_window,
             tap_hold_ms=tap_hold_ms,
             tap_refractory_ms=tap_refractory_ms,
-            spin_radius_osu=spin_radius_osu,
-            spin_speed=spin_speed,
-            slide_follow_radius_osu=slide_follow_radius_osu,
             slide_grace_ms=slide_grace_ms,
             spin_grace_ms=spin_grace_ms,
-            aim_cut_fraction=aim_cut_fraction,
-            lookahead_n=lookahead_n,
         )
 
-        self._prev_cursor: Vec = (256.0, 192.0)
         self._vel: Vec = (0.0, 0.0)
         self._last_t: Optional[float] = None
 
@@ -94,8 +63,6 @@ class Controller:
         self.reference.reset(cursor)
         self._last_t = None
         self._vel = (0.0, 0.0)
-        if cursor is not None:
-            self._prev_cursor = cursor
 
     def update(
         self,
@@ -109,31 +76,29 @@ class Controller:
 
         ref = self.reference.update(detections, cursor, t_ms, to_osu)
 
-        if ref.phase == PHASE_IDLE:
-            cmd_x, cmd_y = cursor
+        if ref.phase == PHASE_IDLE or not self.policy.active:
             self._vel = (0.0, 0.0)
-        else:
-            goal = (ref.x, ref.y)
-            vx, vy = seek_velocity(goal, cursor, self.max_speed, self.seek_tau_ms)
+            return ControlOutput(x=cursor[0], y=cursor[1],
+                                 key_z=ref.key_z, key_x=ref.key_x)
 
-            if self.policy.active:
-                rx, ry = self.policy.residual(ref, cursor, self._prev_cursor, dt_ms)
-                gate = max(0.0, 1.0 - ref.approach_ratio)
-                vx += gate * rx
-                vy += gate * ry
+        tth_fn = self.reference.timing.time_to_hit_ms
+        vx, vy = self.policy.predict(
+            cursor, self._vel, ref.phase, ref.targets, tth_fn,
+        )
 
-            # Kinematic smoothing + speed cap.
-            max_dv = self.max_accel * max(dt_ms, 1e-3)
-            vx, vy = limit_velocity_change(self._vel, (vx, vy), max_dv)
-            speed = (vx * vx + vy * vy) ** 0.5
-            if speed > self.max_speed and speed > 1e-9:
-                s = self.max_speed / speed
-                vx *= s
-                vy *= s
-            self._vel = (vx, vy)
-            cmd_x = cursor[0] + vx * dt_ms
-            cmd_y = cursor[1] + vy * dt_ms
+        # Arrival safeguard: approach phase only, on the most urgent target.
+        if ref.phase == PHASE_APPROACH and ref.targets:
+            approach_targets = [t for t in ref.targets if not t.is_active]
+            if approach_targets:
+                primary = max(approach_targets, key=lambda t: t.approach_ratio)
+                tth = tth_fn(primary.approach_ratio)
+                vx, vy = arrival_safeguard(
+                    (vx, vy), cursor, (primary.x, primary.y), tth,
+                )
 
-        self._prev_cursor = cursor
+        self._vel = (vx, vy)
+        cmd_x = cursor[0] + vx * dt_ms
+        cmd_y = cursor[1] + vy * dt_ms
+
         return ControlOutput(x=cmd_x, y=cmd_y,
                              key_z=ref.key_z, key_x=ref.key_x)
