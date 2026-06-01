@@ -6,8 +6,8 @@ Instead of capturing the live game, this reuses the data-synthesis renderer to
 draw a real beatmap frame-by-frame, then runs the *actual* runtime stack on each
 frame::
 
-    rendered frame  ->  YOLO detect  ->  approach ratio (from ring boxes)
-                    ->  deterministic Controller  ->  (target x/y, Z, X)
+     rendered frame  ->  YOLO detect  ->  approach ratio (from ring boxes)
+                    ->  Controller (trajectory model + keys)  ->  (cursor x/y, Z, X)
 
 The controller's commanded cursor + key presses are overlaid on the frame and
 written to an annotated MP4. The replay's human cursor (drawn by the renderer)
@@ -67,8 +67,8 @@ def main():
     p.add_argument("--skin", "-s", required=True, help="osu! skin directory")
     p.add_argument("--detector", default="runs/detect/train/weights/best.pt")
     p.add_argument("--motion-net", default=None,
-                   help="optional learned style-residual weights; omit to run "
-                        "on the pure deterministic seek")
+                   help="learned trajectory model weights (.pt); omit to hold "
+                        "cursor in place (model inactive)")
     p.add_argument("--output", "-o", default="demo.mp4")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--width", type=int, default=640)

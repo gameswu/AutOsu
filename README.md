@@ -1,37 +1,36 @@
 # AutOsu
 
 Vision-based osu! standard mode AI player. Uses screen capture, object detection,
-approach-circle timing, and a deterministic vision-only controller to play
+approach-circle timing, and a learned attention-based trajectory model to play
 beatmaps autonomously.
 
 ## Architecture
 
 ```
 Screen Capture   →  YOLOv8n Detect  →  Approach (ring box)  →  Controller       →  SendInput
-  (DXcam ~2ms)       (5 classes)        (ring size → ratio)    (target + path)     (1000Hz)
+  (DXcam ~2ms)       (6 classes)        (ring size → ratio)    (trajectory model)   (1000Hz)
 ```
 
-Detection is learned (YOLO); the player is **vision-only** and built as a
-**deterministic goal-seek + optional learned style residual**:
+Detection is learned (YOLO); the player is **vision-only** with an
+**attention-based trajectory model** for cursor motion and **rule-based key
+presses**:
 
 ```
-goal(t), keys(t) = reference(scene)                          # geometry
-v_ref(t)         = seek_velocity(goal, cursor)               # converges (deterministic)
-v_style(t)       = policy.residual(goal-features)            # learned, bounded (optional)
-cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
+targets, keys, phase = reference(scene)                       # target list + keys (rule-based)
+v = trajectory_model(cursor, velocity, phase, targets)        # learned (cross-attention)
+v = arrival_safeguard(v, cursor, primary, tth)                # approach phase only
+cursor(t) = cursor(t-1) + v · dt
 ```
 
-A deterministic *reference* layer owns the hard constraints — the navigation
-goal (most imminent circle / slider-head / slider-ball / spinner sweep point)
-and the key state (taps and holds) — driven purely by the detected
-approach-circle box size. The cursor is moved in **velocity space**: a
-deterministic proportional **seek** that always points at the goal and decays on
-arrival, so the cursor is *mathematically guaranteed to converge* onto each
-object (no behavioural-cloning drift). An **optional** small `tanh`-bounded MLP
-adds a human-like *style residual* on top, gated to ~0 at the tap instant
-(`gate = 1 − approach_ratio`) so accuracy is never sacrificed for style. With no
-trained weights the cursor runs on the pure seek, which already plays
-accurately.
+A rule-based *reference* layer determines the key state (taps and holds) and
+builds the list of visible targets from detections + approach ratios. An
+**attention-based trajectory model** (`TrajectoryModel`) produces the cursor
+velocity: the cursor state queries a variable-length set of targets via
+cross-attention, letting the model learn which target to prioritise and how to
+move. Output is raw `(vx, vy)` — no tanh, no speed cap; the velocity range is
+learned from human replay data. An `arrival_safeguard` (not part of the network)
+ensures the cursor makes sufficient progress toward the primary target during
+approach. Without trained weights the cursor holds position (model inactive).
 
 ## Project Structure
 
@@ -66,10 +65,9 @@ AutOsu/
 │   ├── control/
 │   │   ├── tracker.py          # online timing tracker (approach-ratio → time-to-hit)
 │   │   ├── planner.py          # scene building + target selection
-│   │   ├── motion.py           # MotionProfile dataclass (offline analyze_motion only)
-│   │   ├── reference.py        # deterministic navigation goal + key state (taps/holds)
-│   │   ├── motion_net.py       # deterministic seek + optional learned style residual
-│   │   └── controller.py       # reference goal + seek + gated style → cursor target + keys
+│   │   ├── reference.py        # target list + key state (taps/holds, rule-based)
+│   │   ├── motion_net.py       # TrajectoryModel (attention-based) + TrajectoryPolicy + arrival_safeguard
+│   │   └── controller.py       # reference + trajectory model → cursor velocity + keys
 │   └── runtime/
 │       ├── pipeline.py         # Main loop: capture→detect→approach→controller→inject
 │       ├── capture.py          # DXcam / mss screen capture
@@ -212,7 +210,7 @@ Outputs:
 | Directory | Contents |
 |-----------|----------|
 | `dataset/images/` + `dataset/labels/` | YOLO detection images + labels (cursor rendered from replay) |
-| `dataset/data.yaml` | YOLO dataset descriptor (5 classes) |
+| `dataset/data.yaml` | YOLO dataset descriptor (6 classes) |
 
 The generator emits two phases per slider — a **slider_head** (class 1) with
 its approach-circle during the approach phase, and a **slider_ball** (class 2)
@@ -276,42 +274,35 @@ python scripts/debug_action.py approach-geo \
     --data raw_data --skin "<skin dir>" --frames 1000
 ```
 
-### Step 4 — Controller (no training)
+### Step 4 — Controller (no training needed for keys)
 
-There is no action model to train. The deterministic controller in
-`src/control/` consumes detections + approach ratios every frame and emits a
-cursor target and key state. Inspect it live (capture only, no input injected):
+The key-press logic (tap timing, hold/release) is rule-based and needs no
+training. Cursor motion comes from a **learned trajectory model** — see Step 4.5.
+Inspect the controller live (capture only, no input injected):
 
 ```bash
 python scripts/debug_action.py live
 ```
 
-#### Optional — train the style residual
+#### Step 4.5 — Train the trajectory model
 
-The cursor already plays accurately on the deterministic seek alone. For a more
-human *feel*, train the optional style residual offline on real replays: the
-navigation goal is reconstructed from beatmap ground truth (geometry only, no
-rendering) and the net regresses the human cursor velocity **minus the
-deterministic seek**. The runtime itself stays vision-only.
+The trajectory model learns human cursor motion from real replays. Navigation
+targets are reconstructed from beatmap ground truth (geometry only, no
+rendering) and the model regresses **raw human cursor velocity** given the
+cursor state and visible target set. The runtime itself stays vision-only.
 
 ```bash
-# 1) build the residual dataset (features + human-minus-seek velocity)
-python scripts/build_motion_dataset.py --data raw_data \
-    --output runs/motion/dataset.npz \
-    --max-residual 1.5 --max-speed 4.0 --seek-tau 45
+# 1) build the trajectory dataset (cursor features + targets + velocities)
+python scripts/build_motion_dataset.py -c configs/default.yaml \
+    --data raw_data --output runs/motion/dataset.npz
 
-# 2) train the tanh-bounded MLP (use the SAME --max-residual)
-python scripts/train_motion.py --dataset runs/motion/dataset.npz \
-    --output runs/motion/motion_net.pt --max-residual 1.5
+# 2) train the attention-based trajectory model
+python scripts/train_motion.py -c configs/default.yaml \
+    --dataset runs/motion/dataset.npz --output runs/motion/trajectory.pt
 ```
 
-Then point the config at it with `motion_net_path: runs/motion/motion_net.pt`
-(and a matching `max_residual_osu_pms`, plus the same `max_speed_osu_pms` /
-`seek_tau_ms` used to build the dataset). The residual is added to the seek and
-faded out near each tap (`gate = 1 − approach_ratio`).
-
-> The offline `scripts/analyze_motion.py` (`MotionProfile`) is retained only as
-> a replay-statistics tool; the runtime controller no longer consumes it.
+Then set `motion_net_path: runs/motion/trajectory.pt` in your config. Without
+trained weights the cursor holds position (model inactive).
 
 ### Step 5 — Run the AI
 
@@ -338,7 +329,7 @@ runtime stack** on every rendered frame and writes an annotated MP4:
 
 ```
 rendered frame  →  YOLO detect  →  approach-ring ratio
-                →  deterministic controller  →  cursor target + (z, x)
+                →  controller (trajectory model + keys)  →  cursor + (z, x)
 ```
 
 ```bash
@@ -360,8 +351,8 @@ The overlay shows:
 
 Useful options: `--index N` (which matched pair), `--fps` (should match training
 fps), `--scale` (output upscale), `--conf` (detector confidence). Requires the
-trained detector (`runs/detect/train/weights/best.pt`); the controller needs no
-weights.
+trained detector (`runs/detect/train/weights/best.pt`); optionally the
+trajectory model (`runs/motion/trajectory.pt`).
 
 ### Optional — TensorRT export
 
@@ -374,17 +365,17 @@ trtexec --onnx=runs\detect\train\weights\best.onnx ^
 
 | Component | Architecture | Parameters | Input | Output |
 |-----------|-------------|-----------|-------|--------|
-| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 5-class bounding boxes |
+| Detector | YOLOv8-nano | 3.2M | 640x384 BGR | 6-class bounding boxes |
 | Approach Estimator | Ring-box geometry (no model) | 0 | detections | approach_ratio [0, 1] |
-| Reference | Deterministic geometry | 0 | detections + ratios | navigation goal + (key_z, key_x) |
-| Seek | Deterministic proportional seek | 0 | goal + cursor | converging cursor velocity (≤ max_speed_osu_pms) |
-| Style residual | MLP (`tanh`), **optional** | ~5K | goal-relative features (10) | bounded velocity residual (≤ max_residual_osu_pms), gated |
+| Reference | Rule-based phase FSM | 0 | detections + ratios | target list + (key_z, key_x) + phase |
+| Trajectory Model | Cross-attention + MLP | ~50K | cursor(8) + targets(N×8) | raw (vx, vy) unbounded |
+| Arrival Safeguard | `v_toward ≥ d/tth` constraint | 0 | velocity + primary target | adjusted velocity (approach phase only) |
 
 Detection classes: `hitcircle`(0), `slider_head`(1), `slider_ball`(2),
-`spinner`(3), `approach_circle`(4). Sliders are labeled in two phases: a
-`slider_head` (+`approach_circle`) while approaching, then a `slider_ball` at
-the follow-circle while sliding. The old `slider_body`/`slider_end` classes were
-dropped (body = noisy huge AABB; end = unused by the controller).
+`spinner`(3), `approach_circle`(4), `slider_body`(5). Sliders are labeled in
+two phases: a `slider_head` (+`approach_circle`) while approaching, then a
+`slider_ball` at the follow-circle while sliding. `slider_body` indicates a
+slider is still active (used when the slider_ball is momentarily lost).
 
 ## Coordinate System
 

@@ -5,8 +5,7 @@ Generate training data from raw_data/ (beatmaps + replays).
 Produces a YOLO detection dataset (images + labels) with the cursor rendered.
 Classes: 0 hitcircle, 1 slider_head, 2 slider_ball (follow-circle target during
 an active slide), 3 spinner, 4 approach_circle (ring; box size encodes approach
-ratio), 5 slider_body (visible slider path; slider-active signal).
-Slider body label generation is TODO — currently only classes 0–4 are emitted.
+ratio), 5 slider_body (AABB of slider path, expanded by circle radius).
 
 Input data structure::
 
@@ -280,22 +279,16 @@ def _obj_kind(obj):
         return "circle"
 
 
-# Slider follow circle is ~2x the hitcircle radius; the slider_ball class is
-# labelled at this larger footprint (centred on the ball) for robust detection.
-_FOLLOW_CIRCLE_SCALE = 2.0
-
-
 def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
     """Generate YOLO label lines from visible osr2mp4 hit objects.
 
-    5-class scheme (sliders are represented purely by head + ball, split by
-    phase, so there is at most one slider box per frame):
+    6-class scheme:
         0 hitcircle, 1 slider_head, 2 slider_ball, 3 spinner,
-        4 approach_circle (only while approaching, t_ms < obj time).
+        4 approach_circle, 5 slider_body (AABB of the slider path).
 
-    A slider is in its *approach* phase before its head time (emit head + ring,
-    no ball) and its *slide* phase from head time to end time (emit ball only —
-    the head has been hit and faded).
+    A slider is in its *approach* phase before its head time (emit head + ring
+    + body, no ball) and its *slide* phase from head time to end time (emit
+    ball + body — the head has been hit and faded).
     """
     lines = []
     half_disc_w = (radius_osu * 2 * tf.playfieldscale) / w
@@ -318,23 +311,23 @@ def _generate_labels(visible, t_ms, time_preempt, radius_osu, tf, w, h):
                                   rx, ry, tf, w, h)
 
         elif kind == "slider":
+            # Slider body (class 5) — emitted in both approach and slide phases
+            _append_slider_body(lines, obj, radius_osu, tf, w, h)
+
             if t_ms < obj["time"]:
                 # Approach phase: the head circle is on screen, no ball yet.
                 lines.append(f"1 {cx_n:.6f} {cy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
                 _append_approach_ring(lines, obj, t_ms, time_preempt, radius_osu,
                                       rx, ry, tf, w, h)
             else:
-                # Slide phase: head is gone, follow the ball. Label it at the
-                # larger follow-circle footprint (a far more stable, salient
-                # target than the tiny bare ball) but keep the box centred on
-                # the ball so the tracking point stays exact.
+                # Slide phase: label the ball at hitcircle size (the centre
+                # ball only, not the larger follow-circle ring).
                 ball = _slider_ball_pos(obj, t_ms)
                 if ball is not None:
                     brx, bry = tf.osu_to_render(ball[0], ball[1])
-                    fw = half_disc_w * _FOLLOW_CIRCLE_SCALE
-                    fh = half_disc_h * _FOLLOW_CIRCLE_SCALE
                     lines.append(
-                        f"2 {brx / w:.6f} {bry / h:.6f} {fw:.6f} {fh:.6f}"
+                        f"2 {brx / w:.6f} {bry / h:.6f} "
+                        f"{half_disc_w:.6f} {half_disc_h:.6f}"
                     )
 
         elif kind == "spinner":
@@ -364,6 +357,41 @@ def _append_approach_ring(lines, obj, t_ms, time_preempt, radius_osu,
     ring_w = (radius_osu * 2 * scale * tf.playfieldscale) / w
     ring_h = (radius_osu * 2 * scale * tf.playfieldscale) / h
     lines.append(f"4 {rx / w:.6f} {ry / h:.6f} {ring_w:.6f} {ring_h:.6f}")
+
+
+def _append_slider_body(lines, obj, radius_osu, tf, w, h):
+    """Emit a class-5 slider_body label — AABB of the slider path.
+
+    The bounding box wraps the full slider curve expanded by the circle radius
+    (the body is drawn with that thickness on each side of the centre-line).
+    Emitted in both approach and slide phases.
+    """
+    slider_c = obj.get("slider_c")
+    if slider_c is None or not hasattr(slider_c, "pos") or len(slider_c.pos) < 2:
+        return
+    positions = slider_c.pos
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+    # AABB in osu! coords, expanded by radius for body thickness
+    x_min = min(xs) - radius_osu
+    y_min = min(ys) - radius_osu
+    x_max = max(xs) + radius_osu
+    y_max = max(ys) + radius_osu
+    # Convert corners to render coords
+    rx1, ry1 = tf.osu_to_render(x_min, y_min)
+    rx2, ry2 = tf.osu_to_render(x_max, y_max)
+    # Clamp to image bounds
+    rx1 = max(0, min(w, rx1))
+    ry1 = max(0, min(h, ry1))
+    rx2 = max(0, min(w, rx2))
+    ry2 = max(0, min(h, ry2))
+    bw = abs(rx2 - rx1)
+    bh = abs(ry2 - ry1)
+    if bw < 2 or bh < 2:
+        return
+    cx_n = (rx1 + rx2) / 2 / w
+    cy_n = (ry1 + ry2) / 2 / h
+    lines.append(f"5 {cx_n:.6f} {cy_n:.6f} {bw / w:.6f} {bh / h:.6f}")
 
 
 def _slider_ball_pos(obj, t_ms):
@@ -400,13 +428,14 @@ def _write_data_yaml(out: Path):
         "path": str(out.resolve()),
         "train": "images/train",
         "val": "images/val",
-        "nc": 5,
+        "nc": 6,
         "names": {
             0: "hitcircle",
             1: "slider_head",
             2: "slider_ball",
             3: "spinner",
             4: "approach_circle",
+            5: "slider_body",
         },
     }
     with open(out / "data.yaml", "w") as f:
@@ -415,6 +444,7 @@ def _write_data_yaml(out: Path):
 
 _CLASS_NAMES = [
     "hitcircle", "slider_head", "slider_ball", "spinner", "approach_circle",
+    "slider_body",
 ]
 
 

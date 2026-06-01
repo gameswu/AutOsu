@@ -1,6 +1,6 @@
 # AutOsu Development Roadmap
 
-Vision-based osu! std AI player — learned detection + deterministic vision-only control.
+Vision-based osu! std AI player — learned detection + attention-based trajectory model.
 
 ---
 
@@ -57,7 +57,7 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] Tested: 9000 frames, 0 errors, ~200 fps on test data
 
 ### 2b — Dataset Generator (`scripts/generate_dataset.py`)
-- [x] Unified pipeline: .osu + .osr → YOLO images + labels (5 classes)
+- [x] Unified pipeline: .osu + .osr → YOLO images + labels (6 classes)
 - [x] Uses osr2mp4 renderer for pixel-perfect frame generation
 - [x] Cursor + trail rendered from replay data (so YOLO learns to ignore it)
 - [x] YOLO labels generated from osr2mp4 beatmap hit objects, incl. approach
@@ -68,7 +68,7 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] Configurable FPS, max_beatmaps (post-filter), train/val split
 - [x] Outputs:
   - `dataset/images/` + `dataset/labels/` (YOLO format)
-  - `dataset/data.yaml` (7 classes)
+  - `dataset/data.yaml` (6 classes)
 
 ### 2c — Data Preparation (`scripts/prepare_data.py`)
 - [x] Automatic `.osz` extraction to `beatmaps/` subdirectories
@@ -89,7 +89,7 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 ## Phase 3 — Vision Models [done]
 
 ### 3a — Object Detector (`src/vision/detector.py`)
-- [x] YOLOv8-nano, 5 classes, 640x384 input
+- [x] YOLOv8-nano, 6 classes, 640x384 input
 - [x] Training script (`scripts/train_detector.py`)
 - [x] ONNX export built into training pipeline
 - [ ] TensorRT FP16 export + benchmark
@@ -112,70 +112,57 @@ Vision-based osu! std AI player — learned detection + deterministic vision-onl
 - [x] Per-object approach-ratio → time-to-hit estimate, EMA-smoothed preempt
 - [x] Pure vision, no beatmap parsing
 
-### 4b — Deterministic Reference (`src/control/{planner,reference,controller}.py`)
+### 4b — Reference + Key State (`src/control/{planner,reference,controller}.py`)
 - [x] Scene building + most-imminent target selection (`planner.py`)
-- [x] Navigation goal + key state only (`reference.py`): approach/tap → slide
+- [x] Target list + key state only (`reference.py`): approach/tap → slide
       (reactive ball follow, immediate release at slider end) → spin sweep,
       Z/X alternation. **No hand-coded motion** (no min-jerk / jitter /
       overshoot / dwell — those were removed per the no-simulation mandate).
 - [x] Zero learned parameters in the reference; replaced the behavioral-cloning GRU
-- [x] `src/control/motion.py` reduced to the `MotionProfile` dataclass, used only
-      by the offline `scripts/analyze_motion.py` replay-statistics tool (the
-      runtime controller no longer consumes it)
 
-### 4c — Goal-Seek + Learned Style Residual [implemented; weights optional]
+### 4c — Attention-Based Trajectory Model [implemented; weights pending]
 
-Cursor motion is composed in *velocity* space: a deterministic seek that owns
-accuracy (guaranteed convergence) plus an optional learned residual that owns
-human-like style. Taps/timing can never drift because they are produced by the
-deterministic reference, and the cursor can never drift off-target because the
-seek always pulls it onto the goal — fixing the behavioural-cloning failure
-(smooth motion that misses objects) of a pure learned-velocity policy.
+Cursor motion is produced by a learned **attention-based trajectory model**
+(`TrajectoryModel`). The model receives the current cursor state (position,
+velocity, phase one-hot) and a variable-length set of visible targets via
+cross-attention, then outputs raw cursor velocity `(vx, vy)`. An arrival
+safeguard ensures sufficient approach-phase progress (`v_toward >= d/tth`).
 
 ```
-goal(t), keys(t) = reference(scene)                          # geometry
-v_ref(t)         = seek_velocity(goal, cursor)               # deterministic, converges
-v_style(t)       = policy.residual(goal-features)            # learned, bounded (optional)
-cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
+targets, keys, phase = reference(scene)                       # target list + keys
+v = trajectory_model(cursor, velocity, phase, targets)        # learned (cross-attention)
+v = arrival_safeguard(v, cursor, primary, tth)                # approach phase only
+cursor(t) = cursor(t-1) + v · dt
 ```
 
-- **reference(t)** — `src/control/reference.py` (`ReferenceController`).
-  Recomputed every frame from the *current detections*: the navigation goal
-  (most-imminent target for approach/tap, the detected follow-ball for slide, or
-  the circular sweep point for spin) plus the key/tap state. It guarantees the
-  hard constraints and the tap timing on its own; it does **not** move the cursor.
-- **v_ref(t)** — `src/control/motion_net.py` (`seek_velocity`). A proportional
-  seek `clamp((goal − cursor) / seek_tau_ms, max_speed_osu_pms)` that always
-  points at the goal and decays on arrival → integrating it is critically damped
-  and guaranteed to converge. Zero learned parameters; reactive, not a baked
-  trajectory.
-- **v_style(t)** — `src/control/motion_net.py` (`MotionPolicy` + a small
-  `tanh`-bounded **MLP**) over *goal-relative* features (phase one-hot,
-  approach_ratio, time-to-hit, goal vector in cursor frame, recent velocity;
-  `FEATURE_DIM=10`, shared by runtime and the dataset builder). Output is a
-  bounded velocity **residual** (osu!px/ms), `tanh × max_residual_osu_pms ×
-  style_scale`. **Optional**: no weights ⇒ pure seek (still accurate); a *given*
-  but unreadable path raises `MotionPolicyError`. `gate = 1 − approach_ratio`
-  fades it to ~0 at the tap instant and during slider/spinner contact (ratio=1),
-  so style never costs accuracy. Keys come straight from the reference.
-- **composition** — `src/control/controller.py` (`Controller`) keeps the same
-  public API (`update`/`reset`/`ControlOutput`). Idle phase ⇒ cursor holds;
-  otherwise `cursor += (v_ref + gate·v_style)·dt`.
-- **training** — fully offline / supervised, run on your server:
-  `scripts/build_motion_dataset.py` reconstructs the reference goal
-  frame-by-frame from beatmap ground truth (geometry only, no rendering) and
-  records the human cursor velocity **minus the deterministic seek**,
-  `clip(v_human − v_ref, ±max_residual)`; `scripts/train_motion.py` regresses
-  `residual / max_residual`. No RL, no env rollouts.
-- **runtime** — vision-only; consumes only detections + phase. Runs with or
-  without weights (seek is the floor).
-- **config** — `max_speed_osu_pms` + `seek_tau_ms` (seek); optional
-  `motion_net_path` + `max_residual_osu_pms` + `style_scale` (style). Entry
-  points `autosu-build-motion-dataset`, `autosu-train-motion`. The dataset
-  builder, trainer and runtime must share the same `--max-residual` /
-  `--max-speed` / `--seek-tau`.
-- [ ] (you) build dataset + train style weights on the Linux server (optional;
-  the seek already plays), then set `motion_net_path`
+- **reference** — `src/control/reference.py` (`ReferenceController`). Builds
+  the target list (all visible objects with position, time-to-hit, type,
+  approach ratio) and the key/tap state from detections. Does **not** move the
+  cursor.
+- **TrajectoryModel** — `src/control/motion_net.py`. Architecture:
+  `cursor_encoder(8→64) + target_encoder(8→64, shared) → cross_attention
+  (cursor-as-query, targets-as-keys/values, 2 heads) → MLP(64→128→128→128→2)`.
+  ~50K params. Output is raw unbounded `(vx, vy)` in osu!px/ms — no tanh, no
+  speed cap; magnitude learned from data. Idle embed for zero-target frames.
+- **arrival_safeguard** — `src/control/motion_net.py`. Ensures the velocity
+  component toward the primary target meets `d / tth` during approach phase.
+  This is the irreducible physics constraint, not a kinematic model.
+- **TrajectoryPolicy** — `src/control/motion_net.py`. Wrapper that loads
+  weights and calls the model. `active=False` when no weights are loaded;
+  the cursor holds position.
+- **composition** — `src/control/controller.py` (`Controller`). Calls
+  `TrajectoryPolicy.predict()` → `arrival_safeguard()` → integrates velocity.
+- **training** — fully offline / supervised:
+  `scripts/build_motion_dataset.py` reconstructs targets frame-by-frame from
+  beatmap ground truth and records **raw human cursor velocity**;
+  `scripts/train_motion.py` trains with MSE. No RL, no env rollouts.
+  Dataset format: `.npz` with `cursor_features(N,8)`, `target_features(N,16,8)`,
+  `target_masks(N,16)`, `velocities(N,2)`.
+- **config** — `motion_net_path` (path to `.pt` weights). Key-press timing
+  params: `hit_window`, `tap_hold_ms`, `tap_refractory_ms`, `slide_grace_ms`,
+  `spin_grace_ms`.
+- [ ] (you) build dataset + train trajectory weights on the Linux server, then
+  set `motion_net_path`
 
 ---
 
@@ -219,7 +206,7 @@ cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
 ### 6b — Training Pipeline [next]
 - [ ] Collect raw data: 100+ `.osz` beatmaps + `.osr` replays across 2-5 star difficulty range
 - [ ] Run `prepare_data.py` to verify matching coverage
-- [ ] Generate full dataset with cursor rendering (~30-50K images, 5 classes, balanced)
+- [ ] Generate full dataset with cursor rendering (~30-50K images, 6 classes, balanced)
 - [ ] Train detector to mAP50 > 0.9 (incl. approach_circle / slider_ball)
 - [ ] End-to-end test on easy maps (2-3 star)
 - [ ] Record and review AI gameplay for failure analysis
@@ -246,14 +233,13 @@ cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
 
 ## Dropped / Superseded
 
-- ~~Bezier trajectory generation~~ → superseded by the deterministic velocity
-  seek (`seek_velocity`) toward the vision-derived navigation goal
+- ~~Bezier trajectory generation~~ → superseded by the learned attention-based
+  trajectory model
 - ~~Hand-coded human-motion *simulation* (min-jerk / jitter / overshoot / fixed
-  dwell & reach timers)~~ → removed; human-likeness now comes from a learned,
-  bounded **style residual** on top of the deterministic seek (not hand-tuned
-  curves). The earlier "pure learned-velocity policy, no deterministic motion"
-  variant was reverted because it re-introduced behavioural-cloning drift
-  (smooth cursor that missed objects).
+  dwell & reach timers)~~ → removed; human-likeness now comes from a learned
+  trajectory model (cross-attention over targets). The earlier "deterministic
+  seek + optional style residual" variant was replaced by the fully learned
+  attention-based model.
 - ~~GRU behavioral-cloning action model~~ → replaced by deterministic vision-only
   controller (BC drifted, suffered covariate shift, and was slider-blind)
 - ~~`.npz` state/action sequences~~ → no longer generated (no action model)
@@ -261,11 +247,9 @@ cursor(t)        = cursor(t-1) + (v_ref + gate · v_style) · dt
 - ~~C++ pybind11 input module~~ → ctypes SendInput is sufficient at 1000Hz
 - ~~Manual .osu/.osr pairing by filename~~ → replaced by automatic MD5 hash matching
 - ~~Custom Python renderer~~ → replaced by osr2mp4-core rendering wrapper for pixel-perfect output
-- ~~7-class detection (`slider_body`, `slider_end`)~~ → collapsed to **5 classes**
-  (`hitcircle`, `slider_head`, `slider_ball`, `spinner`, `approach_circle`).
-  `slider_body` was a noisy huge AABB and `slider_end` was unused by the
-  controller. Sliders are now labeled in two phases: head+approach-circle while
-  approaching, ball at the follow-circle while sliding.
+- ~~7-class detection (`slider_end`)~~ → collapsed to **6 classes**.
+  `slider_end` was unused by the controller. `slider_body` retained as class 5
+  (AABB of slider path — signals slider-active when slider_ball is lost).
 - ~~slider_ball never emitted (labeling bug)~~ → the visibility filter dropped a
   whole active slider once its head circle faded (`is_fadeout` read from the
   head), so the slide phase produced no labels. Fixed by keeping mid-slide
