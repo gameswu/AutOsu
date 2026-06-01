@@ -177,9 +177,9 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
     import numpy as np
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
-    from src.control.reference import ReferenceController, build_targets
+    from src.control.reference import ReferenceController, build_targets, PHASE_SPIN
     from src.control.motion_net import (
-        build_cursor_features, build_target_features,
+        build_cursor_features, build_target_features, spin_tangential,
         CURSOR_DIM, TARGET_DIM, MAX_TARGETS,
     )
 
@@ -246,6 +246,17 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
                 if ref.phase != "idle":
                     vhx = (nxt[0] - cur[0]) / dt
                     vhy = (nxt[1] - cur[1]) / dt
+
+                    # Spin: runtime keeps only the tangential component, so the
+                    # label must live in the same subspace.  arrival_safeguard
+                    # (approach/slide) is a runtime-only floor — a no-op on real
+                    # human motion — so those labels stay pure human velocity.
+                    if ref.phase == PHASE_SPIN:
+                        center = next((t for t in ref.targets
+                                       if t.kind == "spinner"), None)
+                        if center is not None:
+                            vhx, vhy = spin_tangential(
+                                (vhx, vhy), cur, (center.x, center.y))
 
                     cur_vel = prev_vel
                     cf = build_cursor_features(cur, cur_vel, ref.phase)
