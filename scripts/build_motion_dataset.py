@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
 """
-Offline motion-policy dataset builder.
+Offline motion dataset builder.
 
 Reconstructs the scene frame-by-frame from beatmap ground truth (no rendering,
 geometry only), pairs it with the real human cursor from the matched replay,
-and records the supervised target — the **full human cursor velocity** (not a
-residual) together with the scene context the trajectory model consumes.
+and records phase-routed supervision for the multi-task motion model.
 
-For each timestep:
-  - cursor_state:  (cx, cy, vx, vy, phase_one_hot×4)
-  - targets:       variable-length list of (dx, dy, tth, ratio, circle, slider,
-                   spinner, active), padded to MAX_TARGETS
-  - target_mask:   bool mask for valid targets
-  - velocity:      (vx, vy) in osu!px/ms — raw human cursor velocity
+For each frame we store the model input (cursor_features + padded targets) plus,
+depending on the reference phase:
 
-Output is a ``.npz`` with arrays ready for training::
+  * APPROACH — the movement-primitive boundary and the human path to clone::
+        bnd      = [x0, y0, v0x, v0y, gx, gy, vgx, vgy, tau0]
+                   x0      current human cursor
+                   v0      τ-space velocity dx/dτ of the primary target
+                   g       primary object position (goal)
+                   vg      flow velocity = |v0| toward the next object
+                   tau0    primary approach_ratio (phase parameter)
+        path_tau = PATH_SAMPLES ratios uniformly in [tau0, 1]
+        path_xy  = human cursor at those ratios (the supervised path)
+        velocity = (0, 0)   (unused)
+
+  * SLIDE / SPIN — the raw human velocity (osu!px/ms); spin is projected onto
+    the tangential subspace to match the runtime ``spin_tangential`` constraint::
+        velocity = (vx, vy)
+        bnd / path_* = 0   (unused)
+
+A boolean ``is_approach`` routes the loss in train_motion.py.
+
+Output ``.npz`` arrays::
 
     cursor_features: (N, CURSOR_DIM)
     target_features: (N, MAX_TARGETS, TARGET_DIM)
     target_masks:    (N, MAX_TARGETS)
+    is_approach:     (N,)
+    bnd:             (N, 9)
+    path_tau:        (N, PATH_SAMPLES)
+    path_xy:         (N, PATH_SAMPLES, 2)
     velocities:      (N, 2)
 
 Usage::
@@ -40,6 +57,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 Vec = Tuple[float, float]
+
+PATH_SAMPLES = 8   # ratios sampled over [tau0, 1] for the approach path label
 
 
 # ── replay cursor sampler ──────────────────────────────────────────────────
@@ -170,6 +189,75 @@ def _scene_at(objs: List[_ObjInfo], start_idx: int, t: float):
     return Scene(objects=scene_objs, spinner=spinner), start_idx
 
 
+# ── approach-primitive supervision helpers ─────────────────────────────────
+
+def _primary_obj(objs: List[_ObjInfo], t: float) -> Optional[_ObjInfo]:
+    """The object currently being approached: nearest upcoming head hit."""
+    best: Optional[_ObjInfo] = None
+    for o in objs:
+        if o.kind not in ("circle", "slider"):
+            continue
+        if o.appear <= t <= o.hit:
+            if best is None or o.hit < best.hit:
+                best = o
+    return best
+
+
+def _next_obj(objs: List[_ObjInfo], primary: _ObjInfo) -> Optional[_ObjInfo]:
+    """The object hit immediately after *primary* (for flow-aim v_g)."""
+    best: Optional[_ObjInfo] = None
+    for o in objs:
+        if o.kind not in ("circle", "slider"):
+            continue
+        if o.hit > primary.hit:
+            if best is None or o.hit < best.hit:
+                best = o
+    return best
+
+
+def _approach_sample(primary: _ObjInfo, nxt: Optional[_ObjInfo],
+                     cur: Vec, prev_cur: Vec, dt: float, t: float, track):
+    """Build (bnd, path_tau, path_xy) for one approach frame at time *t*.
+
+    bnd = [x0,y0, v0x,v0y, gx,gy, vgx,vgy, tau0].  Velocities are τ-space
+    (dx/dτ); since τ = (t - appear)/preempt is linear in t, dτ = dt/preempt, so
+    v0 = (cur - prev_cur) * preempt / dt.
+    """
+    preempt = primary.preempt
+    tau0 = primary.ratio(t)
+    g = (primary.x, primary.y)
+
+    if preempt > 0 and dt > 0:
+        scale = preempt / dt
+        v0 = ((cur[0] - prev_cur[0]) * scale, (cur[1] - prev_cur[1]) * scale)
+    else:
+        v0 = (0.0, 0.0)
+
+    # Flow aim: |v0| toward the next object.
+    vg = (0.0, 0.0)
+    if nxt is not None:
+        dx, dy = nxt.x - g[0], nxt.y - g[1]
+        d = (dx * dx + dy * dy) ** 0.5
+        if d > 1e-6:
+            sp = (v0[0] * v0[0] + v0[1] * v0[1]) ** 0.5
+            vg = (sp * dx / d, sp * dy / d)
+
+    bnd = [cur[0], cur[1], v0[0], v0[1], g[0], g[1], vg[0], vg[1], tau0]
+
+    # Human path over the remaining ratio interval [tau0, 1].
+    path_tau: List[float] = []
+    path_xy: List[List[float]] = []
+    span = 1.0 - tau0
+    for k in range(PATH_SAMPLES):
+        frac = k / (PATH_SAMPLES - 1) if PATH_SAMPLES > 1 else 1.0
+        tau_k = tau0 + span * frac
+        t_k = primary.appear + tau_k * preempt
+        px, py = track.at(t_k)
+        path_tau.append(tau_k)
+        path_xy.append([px, py])
+    return bnd, path_tau, path_xy
+
+
 # ── driver ──────────────────────────────────────────────────────────────────
 
 def build(data_dir: str, fps: int, max_replays: Optional[int],
@@ -177,7 +265,10 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
     import numpy as np
     from src.data.replay_parser import find_replay_pairs, parse_replay
     from src.data.osu_parser import OsuParser
-    from src.control.reference import ReferenceController, build_targets, PHASE_SPIN
+    from src.control.reference import (
+        ReferenceController, build_targets,
+        PHASE_APPROACH, PHASE_SPIN,
+    )
     from src.control.motion_net import (
         build_cursor_features, build_target_features, spin_tangential,
         CURSOR_DIM, TARGET_DIM, MAX_TARGETS,
@@ -194,8 +285,15 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
     cursor_all: list = []
     target_all: list = []
     mask_all: list = []
+    isapproach_all: list = []
+    bnd_all: list = []
+    ptau_all: list = []
+    pxy_all: list = []
     vel_all: list = []
     n_replays = 0
+    _ZERO_BND = [0.0] * 9
+    _ZERO_PTAU = [0.0] * PATH_SAMPLES
+    _ZERO_PXY = [[0.0, 0.0] for _ in range(PATH_SAMPLES)]
 
     for osu_path, osr_paths in pairs:
         try:
@@ -244,22 +342,7 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
                 ref = rc.step(scene, cur, t)
 
                 if ref.phase != "idle":
-                    vhx = (nxt[0] - cur[0]) / dt
-                    vhy = (nxt[1] - cur[1]) / dt
-
-                    # Spin: runtime keeps only the tangential component, so the
-                    # label must live in the same subspace.  arrival_safeguard
-                    # (approach/slide) is a runtime-only floor — a no-op on real
-                    # human motion — so those labels stay pure human velocity.
-                    if ref.phase == PHASE_SPIN:
-                        center = next((t for t in ref.targets
-                                       if t.kind == "spinner"), None)
-                        if center is not None:
-                            vhx, vhy = spin_tangential(
-                                (vhx, vhy), cur, (center.x, center.y))
-
-                    cur_vel = prev_vel
-                    cf = build_cursor_features(cur, cur_vel, ref.phase)
+                    cf = build_cursor_features(cur, prev_vel, ref.phase)
                     tf, tm = build_target_features(cur, ref.targets, tth_fn)
 
                     # Pad / truncate to MAX_TARGETS.
@@ -271,13 +354,49 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
                         tf = tf[:MAX_TARGETS]
                         tm = tm[:MAX_TARGETS]
 
-                    cursor_all.append(cf)
-                    target_all.append(tf)
-                    mask_all.append(tm)
-                    vel_all.append([vhx, vhy])
+                    # Human velocity (px/ms) — the slide/spin label and the next
+                    # frame's cursor-feature velocity.
+                    vhx = (nxt[0] - cur[0]) / dt
+                    vhy = (nxt[1] - cur[1]) / dt
+
+                    primary = _primary_obj(objs, t)
+                    is_approach = (ref.phase == PHASE_APPROACH and primary is not None)
+
+                    if is_approach:
+                        # Movement-primitive supervision: clone the human path
+                        # over the remaining ratio interval.
+                        bnd, ptau, pxy = _approach_sample(
+                            primary, _next_obj(objs, primary),
+                            cur, prev_cur, dt, t, track)
+                        cursor_all.append(cf)
+                        target_all.append(tf)
+                        mask_all.append(tm)
+                        isapproach_all.append(True)
+                        bnd_all.append(bnd)
+                        ptau_all.append(ptau)
+                        pxy_all.append(pxy)
+                        vel_all.append([0.0, 0.0])
+                        kept += 1
+                    else:
+                        # Slide / spin: velocity label.  Spin lives in the
+                        # tangential subspace to match runtime spin_tangential.
+                        if ref.phase == PHASE_SPIN:
+                            center = next((tt for tt in ref.targets
+                                           if tt.kind == "spinner"), None)
+                            if center is not None:
+                                vhx, vhy = spin_tangential(
+                                    (vhx, vhy), cur, (center.x, center.y))
+                        cursor_all.append(cf)
+                        target_all.append(tf)
+                        mask_all.append(tm)
+                        isapproach_all.append(False)
+                        bnd_all.append(list(_ZERO_BND))
+                        ptau_all.append(list(_ZERO_PTAU))
+                        pxy_all.append([list(p) for p in _ZERO_PXY])
+                        vel_all.append([vhx, vhy])
+                        kept += 1
 
                     prev_vel = (vhx, vhy)
-                    kept += 1
                 else:
                     prev_vel = (0.0, 0.0)
 
@@ -294,7 +413,8 @@ def build(data_dir: str, fps: int, max_replays: Optional[int],
         print("ERROR: no samples produced", file=sys.stderr)
         sys.exit(1)
 
-    return cursor_all, target_all, mask_all, vel_all, n_replays
+    return (cursor_all, target_all, mask_all, isapproach_all,
+            bnd_all, ptau_all, pxy_all, vel_all, n_replays)
 
 
 def main():
@@ -336,7 +456,8 @@ def main():
 
     print(f"[build_motion] fps={args.fps}  ref_kwargs={ref_kwargs}")
 
-    cursor_all, target_all, mask_all, vel_all, n_replays = build(
+    (cursor_all, target_all, mask_all, isapproach_all,
+     bnd_all, ptau_all, pxy_all, vel_all, n_replays) = build(
         data_dir, args.fps, args.max_replays, ref_kwargs=ref_kwargs,
     )
 
@@ -348,16 +469,24 @@ def main():
         cursor_features=np.asarray(cursor_all, dtype=np.float32),
         target_features=np.asarray(target_all, dtype=np.float32),
         target_masks=np.asarray(mask_all, dtype=np.bool_),
+        is_approach=np.asarray(isapproach_all, dtype=np.bool_),
+        bnd=np.asarray(bnd_all, dtype=np.float32),
+        path_tau=np.asarray(ptau_all, dtype=np.float32),
+        path_xy=np.asarray(pxy_all, dtype=np.float32),
         velocities=np.asarray(vel_all, dtype=np.float32),
         fps=np.int32(args.fps),
     )
 
+    n_ap = int(np.sum(isapproach_all))
     print("\n── dataset ─────────────────────────────")
     print(f"  replays      : {n_replays}")
     print(f"  samples      : {len(cursor_all)}")
+    print(f"  approach     : {n_ap}  ({100*n_ap/max(1,len(cursor_all)):.1f}%)")
+    print(f"  slide/spin   : {len(cursor_all) - n_ap}")
     print(f"  cursor_dim   : {len(cursor_all[0])}")
     print(f"  max_targets  : {len(target_all[0])}")
     print(f"  target_dim   : {len(target_all[0][0])}")
+    print(f"  path_samples : {PATH_SAMPLES}")
     print(f"\nWrote {out}")
 
 

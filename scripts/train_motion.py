@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Train the attention-based trajectory model.
+Train the attention-based motion model (multi-task).
 
-Supervised regression of the **full human cursor velocity** (osu!px/ms) on the
-dataset built by ``scripts/build_motion_dataset.py``::
+The model (:func:`src.control.motion_net.make_trajectory_model`) emits, per
+frame, residual weights ``w`` for the approach movement primitive and a velocity
+``v`` for the slide/spin phases.  The loss is phase-routed by ``is_approach``::
 
-    loss = MSE(model(cursor_features, target_features, target_mask), velocity)
+    approach:  MSE( primitive(bnd, w)(path_tau), path_xy )   # cloned human path
+    slide/spin: MSE( v, velocities )                          # human velocity
 
-The model is :func:`src.control.motion_net.make_trajectory_model`.  Output is
-raw (vx, vy) — no tanh normalisation; the velocity range is learned from data.
+The minimum-jerk boundary guarantees on-target arrival; training only shapes the
+residual style (approach) and the slide/spin velocity.  Output is raw — no tanh.
 
 The saved checkpoint is a plain ``state_dict`` loadable by
 :class:`src.control.motion_net.TrajectoryPolicy`.
@@ -70,12 +72,19 @@ def main():
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, TensorDataset
-    from src.control.motion_net import make_trajectory_model, CURSOR_DIM, TARGET_DIM
+    from src.control.motion_net import (
+        make_trajectory_model, primitive_path_torch,
+        CURSOR_DIM, TARGET_DIM, N_BASIS,
+    )
 
     data = np.load(dataset_path)
     cursor_feats = data["cursor_features"].astype("float32")
     target_feats = data["target_features"].astype("float32")
     target_masks = data["target_masks"]
+    is_approach = data["is_approach"].astype("bool")
+    bnd = data["bnd"].astype("float32")
+    path_tau = data["path_tau"].astype("float32")
+    path_xy = data["path_xy"].astype("float32")
     velocities = data["velocities"].astype("float32")
 
     if cursor_feats.shape[1] != CURSOR_DIM:
@@ -96,6 +105,7 @@ def main():
     # Sanity: detect NaN / Inf in loaded data.
     for name, arr in [("cursor_features", cursor_feats),
                       ("target_features", target_feats),
+                      ("bnd", bnd), ("path_xy", path_xy),
                       ("velocities", velocities)]:
         bad = ~np.isfinite(arr)
         if bad.any():
@@ -111,8 +121,10 @@ def main():
         print(f"[train] {n_no_tgt}/{n} samples have empty target masks "
               f"({100*n_no_tgt/n:.1f}%) — model uses idle_embed for these")
 
-    vel_rms = float(np.sqrt(np.mean(velocities ** 2)))
-    print(f"[train] device={device}  samples={n}  vel_rms={vel_rms:.4f} osu!px/ms")
+    n_ap = int(is_approach.sum())
+    vel_rms = float(np.sqrt(np.mean(velocities[~is_approach] ** 2))) if n_ap < n else 0.0
+    print(f"[train] device={device}  samples={n}  approach={n_ap}  "
+          f"slide/spin={n - n_ap}  vel_rms={vel_rms:.4f} osu!px/ms")
 
     # Train / val split.
     idx = np.random.default_rng(0).permutation(n)
@@ -124,6 +136,10 @@ def main():
             torch.from_numpy(cursor_feats[ix]),
             torch.from_numpy(target_feats[ix]),
             torch.from_numpy(target_masks[ix]),
+            torch.from_numpy(is_approach[ix]),
+            torch.from_numpy(bnd[ix]),
+            torch.from_numpy(path_tau[ix]),
+            torch.from_numpy(path_xy[ix]),
             torch.from_numpy(velocities[ix]),
         )
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
@@ -136,7 +152,29 @@ def main():
     print(f"[train] model params: {n_params:,}")
 
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    loss_fn = torch.nn.MSELoss()
+    K = N_BASIS
+
+    def _batch_loss(cb, tb, mb, ab, bb, ptb, pxb, vb):
+        """Phase-routed loss: approach path-MSE + slide/spin velocity-MSE."""
+        out = net(cb, tb, mb)                 # (B, 2*K + 2)
+        w = out[:, :2 * K]
+        vel = out[:, 2 * K:]
+        zero = out.sum() * 0.0
+        # Approach: clone the human path via the primitive.
+        if ab.any():
+            x0 = bb[ab, 0:2]
+            v0 = bb[ab, 2:4]
+            g = bb[ab, 4:6]
+            vg = bb[ab, 6:8]
+            tau0 = bb[ab, 8:9]
+            pred_path = primitive_path_torch(x0, v0, g, vg, tau0, w[ab], ptb[ab])
+            loss_a = ((pred_path - pxb[ab]) ** 2).mean()
+        else:
+            loss_a = zero
+        # Slide / spin: regress the human velocity.
+        nb = ~ab
+        loss_v = ((vel[nb] - vb[nb]) ** 2).mean() if nb.any() else zero
+        return loss_a + loss_v, loss_a, loss_v
 
     best_val = float("inf")
     out = Path(output_path)
@@ -145,43 +183,42 @@ def main():
     for epoch in range(1, epochs + 1):
         net.train()
         tr_loss = 0.0
-        for cb, tb, mb, vb in tr_loader:
-            cb = cb.to(device)
-            tb = tb.to(device)
-            mb = mb.to(device)
-            vb = vb.to(device)
+        for batch in tr_loader:
+            batch = [x.to(device) for x in batch]
             opt.zero_grad()
-            pred = net(cb, tb, mb)
-            loss = loss_fn(pred, vb)
+            loss, _, _ = _batch_loss(*batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
             opt.step()
-            tr_loss += loss.item() * len(cb)
+            tr_loss += loss.item() * len(batch[0])
         tr_loss /= max(1, len(tr_idx))
 
         val_loss = tr_loss
+        val_a = val_v = 0.0
         if val_loader is not None:
             net.eval()
-            vl = 0.0
+            vl = va = vv = 0.0
             with torch.no_grad():
-                for cb, tb, mb, vb in val_loader:
-                    cb = cb.to(device)
-                    tb = tb.to(device)
-                    mb = mb.to(device)
-                    vb = vb.to(device)
-                    vl += loss_fn(net(cb, tb, mb), vb).item() * len(cb)
+                for batch in val_loader:
+                    batch = [x.to(device) for x in batch]
+                    loss, la, lv = _batch_loss(*batch)
+                    nbt = len(batch[0])
+                    vl += loss.item() * nbt
+                    va += float(la) * nbt
+                    vv += float(lv) * nbt
             val_loss = vl / max(1, n_val)
+            val_a = va / max(1, n_val)
+            val_v = vv / max(1, n_val)
 
-        rms = val_loss ** 0.5
-        print(f"  epoch {epoch:3d}  train={tr_loss:.6f}  "
-              f"val={val_loss:.6f}  (~{rms:.4f} osu!px/ms RMS)")
+        print(f"  epoch {epoch:3d}  train={tr_loss:.6f}  val={val_loss:.6f}  "
+              f"(approach_path={val_a:.4f} px²  slide/spin_v={val_v:.6f})")
 
         if val_loss <= best_val:
             best_val = val_loss
             torch.save(net.state_dict(), out)
 
-    print(f"\nBest val MSE {best_val:.6f}  ({best_val**0.5:.4f} RMS)  ->  {out}")
-    print("Set `motion_net_path` in your config to enable the learned trajectory model.")
+    print(f"\nBest val loss {best_val:.6f}  ->  {out}")
+    print("Set `motion_net_path` in your config to enable the learned model.")
 
 
 if __name__ == "__main__":

@@ -1,28 +1,36 @@
-"""Attention-based trajectory model — learned human-like cursor motion.
+"""Attention-based motion model — learned human-like cursor motion.
 
 Architecture::
 
     cursor_state → cursor_encoder ──┐
-    targets[]    → target_encoder   │  cross_attention → output_mlp → (vx, vy)
+    targets[]    → target_encoder   │  cross_attention → output_mlp → (w, v)
                    (shared)        ─┘
 
 The model receives the current cursor state (position, velocity, phase) and a
 variable-length set of visible targets.  Cross-attention lets the cursor
-"query" the targets to decide which to prioritise.  Output is raw velocity in
-osu!px/ms — no tanh, no speed cap; the magnitude range is learned from human
-replay data.
+"query" the targets to decide which to prioritise.
 
-An arrival safeguard (not part of the network) ensures the cursor makes
-sufficient progress toward the primary target during the approach phase.
-This is the irreducible constraint ``distance / time = speed`` — not a
-kinematic model.
+The output is multi-task:
+
+  * ``w`` — residual weights for the **approach movement primitive**.  The
+    executed approach path is a minimum-jerk (quintic) boundary term — which
+    alone guarantees on-time, on-target arrival — plus a learned residual
+    ``Σⱼ wⱼ·sin(jπτ)`` that vanishes at both endpoints, so it shapes the
+    *style* of the path without ever breaking the arrival guarantee.  The phase
+    parameter τ is the observed approach_ratio (fps- and preempt-independent).
+  * ``v`` — raw velocity (osu!px/ms) for the **slide / spin** phases, projected
+    by zero-parameter geometric constraints (``arrival_safeguard`` onto the
+    slider ball, ``spin_tangential`` about the spinner centre).
+
+No tanh, no speed cap; magnitudes are learned from human replay data.
 
 torch is imported lazily.
 """
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+import math
+from typing import Callable, List, Optional, Sequence, Tuple
 
 Vec = Tuple[float, float]
 
@@ -38,6 +46,8 @@ EMBED_DIM = 64
 N_HEADS = 2
 MLP_HIDDEN = 128
 MAX_TARGETS = 16         # padding width for datasets
+N_BASIS = 4              # residual basis functions per axis: sin(jπτ), j=1..N_BASIS
+OUTPUT_DIM = 2 * N_BASIS + 2   # [residual weights (x,y) | slide/spin velocity (x,y)]
 
 
 # ── feature builders ──────────────────────────────────────────────────────────
@@ -121,7 +131,7 @@ def make_trajectory_model(
                 nn.ReLU(),
                 nn.Linear(mlp_hidden, mlp_hidden),
                 nn.ReLU(),
-                nn.Linear(mlp_hidden, 2),
+                nn.Linear(mlp_hidden, OUTPUT_DIM),
             )
 
         def forward(self, cursor_features, target_features, target_mask):
@@ -131,7 +141,7 @@ def make_trajectory_model(
                 target_features: (B, N, target_dim) — zero-padded
                 target_mask:     (B, N) — True = valid target
             Returns:
-                velocity: (B, 2) — osu!px/ms, unbounded
+                out: (B, OUTPUT_DIM) — [residual weights (2*N_BASIS) | velocity (2)]
             """
             B = cursor_features.shape[0]
             cursor_embed = self.cursor_encoder(cursor_features)
@@ -218,9 +228,15 @@ class TrajectoryPolicy:
         phase: str,
         targets: list,
         tth_from_ratio: Optional[Callable[[float], float]] = None,
-    ) -> Vec:
+    ) -> Tuple[List[float], Vec]:
+        """Return ``(residual_weights, velocity)``.
+
+        ``residual_weights`` (length ``2*N_BASIS``) shapes the approach
+        movement primitive; ``velocity`` (osu!px/ms) drives the slide/spin
+        phases.  When no weights are loaded, returns zeros.
+        """
         if self._net is None:
-            return (0.0, 0.0)
+            return ([0.0] * (2 * N_BASIS), (0.0, 0.0))
         torch = self._torch
         cf = build_cursor_features(cursor, velocity, phase)
         tf, tm = build_target_features(cursor, targets, tth_from_ratio)
@@ -235,7 +251,92 @@ class TrajectoryPolicy:
                                 device=self.device)
                 m = torch.zeros(1, 1, dtype=torch.bool, device=self.device)
             out = self._net(c, t, m)[0]
-            return (float(out[0]), float(out[1]))
+            w = [float(x) for x in out[:2 * N_BASIS]]
+            vel = (float(out[2 * N_BASIS]), float(out[2 * N_BASIS + 1]))
+            return (w, vel)
+
+
+# ── movement primitive (minimum-jerk boundary + endpoint-vanishing residual) ──
+#
+# The approach path over the remaining interval [τ₀, 1] is::
+#
+#     s(τ) = B(u; x₀,v₀,g,v_g) + Σⱼ wⱼ·sin(jπu),   u = (τ-τ₀)/(1-τ₀)
+#
+# B is the minimum-jerk quintic with boundary conditions s(τ₀)=x₀, s'(τ₀)=v₀,
+# s(1)=g, s'(1)=v_g and the natural free-acceleration conditions s'''=0 at both
+# ends.  Velocities are in τ-space (dx/dτ), so the path shape is independent of
+# fps and of the preempt time.  The residual basis sin(jπu) vanishes at u=0 and
+# u=1, so s(1)=g exactly — on-target arrival is guaranteed by construction,
+# whatever the network outputs.  Zero hand-tuned parameters.
+
+
+def _axis_primitive(x0: float, v0: float, g: float, vg: float,
+                    L: float, w_axis: Sequence[float], u: float) -> float:
+    """One-axis primitive position at normalised phase ``u`` ∈ [0, 1].
+
+    ``L = 1 - τ₀`` reparametrises the remaining interval; τ-space velocities
+    ``v0``/``vg`` are scaled to u-space by ``L``.
+    """
+    V0 = v0 * L
+    Vg = vg * L
+    c5 = (g - x0) - 0.5 * (V0 + Vg)
+    c4 = -2.5 * c5
+    c2 = (g - x0 - V0) + 1.5 * c5
+    p = x0 + V0 * u + c2 * u * u + c4 * u ** 4 + c5 * u ** 5
+    r = 0.0
+    for k, wk in enumerate(w_axis):
+        r += wk * math.sin((k + 1) * math.pi * u)
+    return p + r
+
+
+def eval_primitive(x0: Vec, v0: Vec, g: Vec, vg: Vec,
+                   tau0: float, w: Sequence[float], tau: float) -> Vec:
+    """Evaluate the approach primitive at phase ``tau`` (absolute position).
+
+    *x0, v0*: current cursor position and τ-space velocity (dx/dτ).
+    *g, vg*:  goal position and τ-space flow velocity (toward next object).
+    *tau0*:   current approach_ratio; *tau*: query ratio (≥ tau0).
+    *w*:      residual weights, length ``2*N_BASIS`` (x-axis then y-axis).
+    """
+    L = 1.0 - tau0
+    if L < 1e-6:
+        return (g[0], g[1])
+    u = (tau - tau0) / L
+    u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+    wx = w[:N_BASIS]
+    wy = w[N_BASIS:2 * N_BASIS]
+    return (
+        _axis_primitive(x0[0], v0[0], g[0], vg[0], L, wx, u),
+        _axis_primitive(x0[1], v0[1], g[1], vg[1], L, wy, u),
+    )
+
+
+def primitive_path_torch(x0, v0, g, vg, tau0, w, taus):
+    """Differentiable batched primitive for training.
+
+    Shapes: x0/v0/g/vg (B,2); tau0 (B,1); w (B, 2*N_BASIS); taus (B,P).
+    Returns positions (B, P, 2).
+    """
+    import torch
+    L = (1.0 - tau0).clamp_min(1e-6)             # (B,1)
+    u = ((taus - tau0) / L).clamp(0.0, 1.0)      # (B,P)
+    K = N_BASIS
+    k = torch.arange(1, K + 1, device=u.device, dtype=u.dtype)
+    basis = torch.sin(u.unsqueeze(-1) * k.view(1, 1, K) * math.pi)  # (B,P,K)
+    outs = []
+    for a in range(2):
+        x0a = x0[:, a:a + 1]
+        V0 = v0[:, a:a + 1] * L
+        ga = g[:, a:a + 1]
+        Vg = vg[:, a:a + 1] * L
+        c5 = (ga - x0a) - 0.5 * (V0 + Vg)
+        c4 = -2.5 * c5
+        c2 = (ga - x0a - V0) + 1.5 * c5
+        p = x0a + V0 * u + c2 * u ** 2 + c4 * u ** 4 + c5 * u ** 5   # (B,P)
+        wa = w[:, a * K:(a + 1) * K]                                 # (B,K)
+        r = (basis * wa.unsqueeze(1)).sum(-1)                        # (B,P)
+        outs.append(p + r)
+    return torch.stack(outs, dim=-1)             # (B,P,2)
 
 
 # ── arrival safeguard ─────────────────────────────────────────────────────────
