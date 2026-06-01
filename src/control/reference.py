@@ -185,14 +185,21 @@ class ReferenceController:
         has_ball = any(o.has_ball for o in scene.objects if o.kind == "slider")
         has_body = getattr(scene, "has_slider_body", False)
 
-        if has_ball or has_body:
+        # The slider BALL only appears once the slider is active (head hit), so
+        # it is the sole trigger for entering/holding the slide phase.
+        if has_ball:
             if self._held_key is None:
                 self._held_key = self._take_key()
             self._state = PHASE_SLIDE
             self._slide_last_seen_t = t_ms
             return self._finish(targets, t_ms, PHASE_SLIDE)
 
+        # A slider BODY is also drawn during the approach window, so it must
+        # NEVER start a slide — it only keeps an already-active slide alive when
+        # the ball detection briefly drops out.
         if self._state == PHASE_SLIDE:
+            if has_body:
+                self._slide_last_seen_t = t_ms
             if (t_ms - self._slide_last_seen_t) <= self.slide_grace_ms:
                 return self._finish(targets, t_ms, PHASE_SLIDE)
             self._held_key = None
